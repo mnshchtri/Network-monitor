@@ -1,5 +1,3 @@
-### `README.md`
-
 # Network Monitor
 
 A simple network monitoring tool that captures and analyzes network packets using Scapy.
@@ -45,10 +43,7 @@ python3 network_monitor.py <duration>
 
 This project is licensed under the MIT License.
 ```
-
- `requirements.txt`
-```plaintext
-scapy
+requirements.txt
 ```
 
 ### Explanation
