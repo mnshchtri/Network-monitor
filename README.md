@@ -76,6 +76,25 @@ sudo netwatch tui
 
 Hosts on the left, then per-host tabs: **Alerts**, **Listening ports** (with owning process), **Connections**, and **Changes** (a log of ports that opened or closed, the first thing to check in an investigation). Keys: `↑↓` select, `Tab` switch pane, `←→`/`1-4` tabs, `a` acknowledge, `A` acknowledge all, `x` show acknowledged, `q` quit. `netwatch tui --snapshot` prints one frame as plain text.
 
+### Web dashboard
+
+The same views as the console UI in a browser: host list with live status, alert feed with acknowledge, and per-host Alerts / Listening ports / Connections / Changes tabs with filtering and a connection sparkline.
+
+```sh
+sudo netwatch server set-password     # required first: no default credentials (min 10 chars)
+sudo netwatch web                     # http://127.0.0.1:8080
+```
+
+It binds to loopback by default. From your laptop, tunnel over SSH and browse to `http://127.0.0.1:8080`:
+
+```sh
+ssh -L 8080:127.0.0.1:8080 you@server
+```
+
+To serve it on a real hostname, put it behind an HTTPS reverse proxy (nginx/Caddy) and run `netwatch web --listen 127.0.0.1:8080 --allow-host netwatch.example.com --secure`. Do not expose the plain-HTTP listener directly.
+
+Hardening: PBKDF2-SHA256 password hashing, `HttpOnly` + `SameSite=Strict` session cookie, lockout after 5 failed logins (5 minutes), Host-header allowlist (DNS-rebinding defence), CSRF checks on every state-changing request, strict Content-Security-Policy with no third-party assets, and every agent-supplied string rendered as text, never HTML. Sessions are in memory and last 8 hours.
+
 Server administration:
 
 ```sh

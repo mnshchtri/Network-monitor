@@ -9,7 +9,7 @@ repository = "https://github.com/mnshchtri/Network-monitor"
 [features]
 default = ["fleet"]
 # Agent/server/TUI. Build with --no-default-features for the dependency-free standalone CLI.
-fleet = ["dep:rustls", "dep:rcgen", "dep:serde", "dep:serde_json", "dep:rusqlite", "dep:ratatui", "dep:sha2", "dep:webpki-roots"]
+fleet = ["dep:rustls", "dep:rcgen", "dep:serde", "dep:serde_json", "dep:rusqlite", "dep:ratatui", "dep:sha2", "dep:webpki-roots", "dep:pbkdf2"]
 
 [dependencies]
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
@@ -20,6 +20,7 @@ rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 ratatui = { version = "0.30", optional = true }
 sha2 = { version = "0.10", optional = true }
 webpki-roots = { version = "1", optional = true }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], optional = true }
 
 [profile.release]
 opt-level = 3

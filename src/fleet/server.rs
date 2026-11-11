@@ -39,6 +39,8 @@ netwatch server - central collector
                           Server-only: down_after (seconds of silence before HOST_DOWN, default 90)
                           webhook_url (Slack/Discord/any https endpoint), webhook_min_severity
                           (INFO|MEDIUM|HIGH, default MEDIUM), webhook_format (auto|slack|discord|generic)
+    netwatch server set-password [--dir D]
+                          Set the web dashboard password (prompted; or --password-stdin)
     netwatch server webhook test [--dir D]
                           Send a test message to the configured webhook
     netwatch server config [--dir D]      Show settings
@@ -65,6 +67,7 @@ pub fn cmd(args: &[String]) {
         Some("set") => set(rest),
         Some("config") => config(rest),
         Some("webhook") => webhook_cmd(rest),
+        Some("set-password") => set_password(rest),
         _ => print!("{HELP}"),
     }
 }
@@ -189,6 +192,37 @@ fn config(args: &[String]) {
         };
         println!("{k:<22} {shown}");
     }
+}
+
+fn read_secret(prompt: &str, tty: bool) -> String {
+    use std::io::{BufRead, Write};
+    if tty {
+        eprint!("{prompt}");
+        let _ = std::io::stderr().flush();
+        let _ = std::process::Command::new("stty").arg("-echo").status();
+    }
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+    if tty {
+        let _ = std::process::Command::new("stty").arg("echo").status();
+        eprintln!();
+    }
+    line.trim_end_matches(['\n', '\r']).to_string()
+}
+
+fn set_password(args: &[String]) {
+    use std::io::IsTerminal;
+    let c = open_db(&dir_of(args));
+    let tty = std::io::stdin().is_terminal() && !has(args, "--password-stdin");
+    let pw = read_secret("New web dashboard password: ", tty);
+    if tty && read_secret("Repeat password: ", true) != pw {
+        fail("passwords do not match");
+    }
+    if pw.chars().count() < 10 {
+        fail("password must be at least 10 characters");
+    }
+    db::set_setting(&c, "web_password", &super::web::hash_password(&pw)).unwrap_or_else(|e| fail(&format!("{e}")));
+    println!("web dashboard password set. Start it with: netwatch web");
 }
 
 fn webhook_cmd(args: &[String]) {

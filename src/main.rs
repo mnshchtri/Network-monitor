@@ -27,6 +27,7 @@ COMMANDS:
     agent                 Report to a central server (enroll / run)      [fleet]
     server                Central collector (init / token / run / hosts) [fleet]
     tui                   Console dashboard for the server's data        [fleet]
+    web                   Web dashboard for the server's data            [fleet]
     help | version
 
 FILTERS (ports, conns):
@@ -308,6 +309,8 @@ fn main() {
         Some("agent") => fleet::agent::cmd(&args[1..]),
         #[cfg(feature = "fleet")]
         Some("server") => fleet::server::cmd(&args[1..]),
+        #[cfg(feature = "fleet")]
+        Some("web") => fleet::web::cmd(&args[1..]),
         #[cfg(feature = "fleet")]
         Some("tui") => fleet::tui::cmd(&args[1..]),
         Some("version") | Some("--version") | Some("-V") => println!("netwatch {VERSION}"),
