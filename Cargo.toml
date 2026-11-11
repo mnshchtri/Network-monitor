@@ -1,0 +1,16 @@
+[package]
+name = "netwatch"
+version = "0.1.0"
+edition = "2021"
+description = "Defensive network monitor for Linux servers: listening ports, socket-to-process mapping, and attack detection"
+license = "MIT"
+repository = "https://github.com/mnshchtri/Network-monitor"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -1,0 +1,28 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { arch: x86_64,  target: x86_64-unknown-linux-musl }
+          - { arch: aarch64, target: aarch64-unknown-linux-musl }
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install cross --locked
+      - run: cross build --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          A=netwatch-${{ matrix.arch }}-linux.tar.gz
+          tar -czf $A -C target/${{ matrix.target }}/release netwatch
+          sha256sum $A > $A.sha256
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            netwatch-*.tar.gz
+            netwatch-*.tar.gz.sha256
