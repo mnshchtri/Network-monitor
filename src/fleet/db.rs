@@ -286,14 +286,13 @@ pub struct AlertRow {
     pub ts: u64,
     pub kind: String,
     pub severity: String,
-    pub source: String,
     pub message: String,
     pub acked: bool,
 }
 
 pub fn alerts(c: &Connection, host: Option<&str>, include_acked: bool, limit: usize) -> Res<Vec<AlertRow>> {
     let mut st = c.prepare(
-        "SELECT a.id, COALESCE(h.name, a.host_id), a.ts, a.kind, a.severity, COALESCE(a.source,''), a.message, a.acked
+        "SELECT a.id, COALESCE(h.name, a.host_id), a.ts, a.kind, a.severity, a.message, a.acked
          FROM alerts a LEFT JOIN hosts h ON h.id = a.host_id
          WHERE (?1 IS NULL OR a.host_id = ?1) AND (?2 = 1 OR a.acked = 0)
          ORDER BY a.ts DESC, a.id DESC LIMIT ?3",
@@ -301,7 +300,7 @@ pub fn alerts(c: &Connection, host: Option<&str>, include_acked: bool, limit: us
     let rows = st.query_map(params![host, include_acked as i64, limit as i64], |r| {
         Ok(AlertRow {
             id: r.get(0)?, host: r.get(1)?, ts: r.get::<_, i64>(2)? as u64, kind: r.get(3)?, severity: r.get(4)?,
-            source: r.get(5)?, message: r.get(6)?, acked: r.get::<_, i64>(7)? != 0,
+            message: r.get(5)?, acked: r.get::<_, i64>(6)? != 0,
         })
     })?;
     rows.collect()
