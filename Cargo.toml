@@ -1,6 +1,6 @@
 [package]
 name = "netwatch"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Defensive network monitor for Linux servers: listening ports, socket-to-process mapping, and attack detection"
 license = "MIT"

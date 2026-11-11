@@ -3,7 +3,10 @@
 #   curl -fsSL https://raw.githubusercontent.com/mnshchtri/Network-monitor/main/install.sh | sh
 #
 # Env options:
-#   NETWATCH_SERVICE=1   also install + start a systemd service logging to /var/log/netwatch/alerts.jsonl
+#   NETWATCH_SERVER="--name <address>"   set up the central server as a systemd service
+#   NETWATCH_AGENT="--server h:7443 --token T --pin FP"   enroll this host and run the agent service
+#                        (the exact command is printed by 'netwatch server token')
+#   NETWATCH_SERVICE=1   standalone mode: local detection as a systemd service
 #   NETWATCH_VERSION=v0.1.0   install a specific release (default: latest)
 #   NETWATCH_FROM_SOURCE=1    skip the prebuilt binary and compile with cargo
 #   PREFIX=/some/dir     install directory for the binary
@@ -96,16 +99,107 @@ say "Installed $DEST/$BIN ($("$DEST/$BIN" version))"
 
 case ":$PATH:" in *":$DEST:"*) ;; *) say "Note: $DEST is not on your PATH" ;; esac
 
-if [ -n "${NETWATCH_SERVICE:-}" ]; then
-  have systemctl || fail "systemd not found; cannot install the service"
-  say "Installing systemd service"
-  UNIT="$TMP/netwatch.service"
-  fetch "https://raw.githubusercontent.com/$REPO/main/packaging/netwatch.service" "$UNIT"
-  sed -i "s|/usr/local/bin/netwatch|$DEST/$BIN|" "$UNIT"
-  $SUDO install -m 0644 "$UNIT" /etc/systemd/system/netwatch.service
+need_systemd() {
+  have systemctl || fail "systemd not found; cannot install a service (run the command manually instead)"
+  { [ "$(id -u)" -eq 0 ] || [ -n "$SUDO" ]; } || fail "root (or sudo) is required to install a service"
+}
+
+install_unit() { # name  (unit text on stdin)
+  cat > "$TMP/$1.service"
+  $SUDO install -m 0644 "$TMP/$1.service" "/etc/systemd/system/$1.service"
   $SUDO systemctl daemon-reload
-  $SUDO systemctl enable --now netwatch.service
-  say "Service running. Alerts: /var/log/netwatch/alerts.jsonl   Live: journalctl -fu netwatch"
+  $SUDO systemctl enable --now "$1.service"
+}
+
+# Standalone mode: local detection only, alerts to a JSON-lines file.
+if [ -n "${NETWATCH_SERVICE:-}" ]; then
+  need_systemd
+  say "Installing standalone watch service"
+  install_unit netwatch <<UNIT
+[Unit]
+Description=netwatch defensive network monitor
+After=network.target
+
+[Service]
+ExecStart=$DEST/$BIN watch --log /var/log/netwatch/alerts.jsonl
+Restart=on-failure
+LogsDirectory=netwatch
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/log/netwatch
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  say "Running. Alerts: /var/log/netwatch/alerts.jsonl   Live: journalctl -fu netwatch"
+fi
+
+# Central server: NETWATCH_SERVER="--name server.example.com"  (the address agents will use)
+if [ -n "${NETWATCH_SERVER:-}" ]; then
+  need_systemd
+  say "Setting up the netwatch server"
+  if [ ! -f /var/lib/netwatch-server/server.pem ]; then
+    # shellcheck disable=SC2086
+    $SUDO "$DEST/$BIN" server init $NETWATCH_SERVER
+  fi
+  install_unit netwatch-server <<UNIT
+[Unit]
+Description=netwatch central server
+After=network.target
+
+[Service]
+ExecStart=$DEST/$BIN server run --log /var/lib/netwatch-server/alerts.jsonl
+Restart=on-failure
+StateDirectory=netwatch-server
+StateDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/lib/netwatch-server
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  say "Server running on port 7443 (allow it in your firewall). Add monitored hosts with a token:"
+  $SUDO "$DEST/$BIN" server token
+  say "Dashboard: sudo netwatch tui"
+fi
+
+# Monitored host: NETWATCH_AGENT="--server host:7443 --token T --pin FP" (from 'netwatch server token')
+if [ -n "${NETWATCH_AGENT:-}" ]; then
+  need_systemd
+  say "Enrolling this host"
+  # shellcheck disable=SC2086
+  $SUDO "$DEST/$BIN" agent enroll $NETWATCH_AGENT
+  install_unit netwatch-agent <<UNIT
+[Unit]
+Description=netwatch agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=$DEST/$BIN agent run
+Restart=always
+RestartSec=5
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/etc/netwatch
+# Needed to map sockets to processes owned by other users; nothing else.
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  say "Agent running. Logs: journalctl -fu netwatch-agent"
 fi
 
 cat <<MSG
@@ -113,5 +207,7 @@ cat <<MSG
 Try it (run with sudo to see process names for every socket):
   sudo netwatch ports          # listening ports + owning process
   sudo netwatch conns          # every connection
-  sudo netwatch watch          # live attack detection
+  sudo netwatch watch          # live attack detection (standalone)
+
+Fleet mode:  netwatch server | netwatch agent | netwatch tui   (see README)
 MSG
