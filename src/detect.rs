@@ -114,6 +114,10 @@ impl Detector {
         out.push(a);
     }
 
+    pub fn set_config(&mut self, cfg: Config) {
+        self.cfg = cfg;
+    }
+
     pub fn tick(&mut self, socks: &[Sock], owners: &HashMap<u64, proc::ProcInfo>) -> Vec<Alert> {
         let now = Instant::now();
         let mut alerts = Vec::new();

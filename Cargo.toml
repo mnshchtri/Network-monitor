@@ -6,7 +6,19 @@ description = "Defensive network monitor for Linux servers: listening ports, soc
 license = "MIT"
 repository = "https://github.com/mnshchtri/Network-monitor"
 
+[features]
+default = ["fleet"]
+# Agent/server/TUI. Build with --no-default-features for the dependency-free standalone CLI.
+fleet = ["dep:rustls", "dep:rcgen", "dep:serde", "dep:serde_json", "dep:rusqlite", "dep:ratatui", "dep:sha2"]
+
 [dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
+ratatui = { version = "0.30", optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [profile.release]
 opt-level = 3

@@ -1,4 +1,6 @@
 mod detect;
+#[cfg(feature = "fleet")]
+mod fleet;
 mod proc;
 
 use detect::{Alert, Config, Detector, Severity};
@@ -22,6 +24,9 @@ COMMANDS:
     ports                 Listening ports with owning process (like lsof -i / ss -ltnup)
     conns                 All sockets with owning process and state
     watch                 Continuously monitor and alert on suspected attacks
+    agent                 Report to a central server (enroll / run)      [fleet]
+    server                Central collector (init / token / run / hosts) [fleet]
+    tui                   Console dashboard for the server's data        [fleet]
     help | version
 
 FILTERS (ports, conns):
@@ -299,6 +304,12 @@ fn main() {
         Some("ports") => list(&args[1..], true),
         Some("conns") => list(&args[1..], false),
         Some("watch") => watch(&args[1..]),
+        #[cfg(feature = "fleet")]
+        Some("agent") => fleet::agent::cmd(&args[1..]),
+        #[cfg(feature = "fleet")]
+        Some("server") => fleet::server::cmd(&args[1..]),
+        #[cfg(feature = "fleet")]
+        Some("tui") => fleet::tui::cmd(&args[1..]),
         Some("version") | Some("--version") | Some("-V") => println!("netwatch {VERSION}"),
         Some("help") | Some("--help") | Some("-h") | None => print!("{HELP}"),
         Some(o) => die(&format!("unknown command '{o}'")),
