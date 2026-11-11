@@ -3,12 +3,14 @@
 use super::db;
 use super::pki;
 use super::proto::{self, Request, Response};
+use super::webhook::{self, Notification};
 use super::util::*;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -35,6 +37,10 @@ netwatch server - central collector
                           Push a setting to all agents. Keys: report_interval window scan_ports
                           rate_limit conn_limit syn_limit rst_rate ignore (comma list of IPs)
                           Server-only: down_after (seconds of silence before HOST_DOWN, default 90)
+                          webhook_url (Slack/Discord/any https endpoint), webhook_min_severity
+                          (INFO|MEDIUM|HIGH, default MEDIUM), webhook_format (auto|slack|discord|generic)
+    netwatch server webhook test [--dir D]
+                          Send a test message to the configured webhook
     netwatch server config [--dir D]      Show settings
 
 Default dir: /var/lib/netwatch-server (root) or ~/.local/share/netwatch-server
@@ -58,6 +64,7 @@ pub fn cmd(args: &[String]) {
         Some("revoke") => revoke(rest),
         Some("set") => set(rest),
         Some("config") => config(rest),
+        Some("webhook") => webhook_cmd(rest),
         _ => print!("{HELP}"),
     }
 }
@@ -137,31 +144,73 @@ fn set(args: &[String]) {
         (Some(k), Some(v)) if !k.starts_with("--") => (k.as_str(), v.as_str()),
         _ => fail("usage: netwatch server set <key> <value>"),
     };
-    if !db::SETTING_KEYS.contains(&k) && k != "down_after" {
-        fail(&format!("unknown key '{k}'. Valid: {} down_after", db::SETTING_KEYS.join(" ")));
+    if !db::SETTING_KEYS.contains(&k) && !db::SERVER_KEYS.contains(&k) {
+        fail(&format!("unknown key '{k}'. Valid: {} {}", db::SETTING_KEYS.join(" "), db::SERVER_KEYS.join(" ")));
     }
-    if k == "ignore" {
-        for ip in v.split(',').filter(|s| !s.trim().is_empty()) {
-            if ip.trim().parse::<std::net::IpAddr>().is_err() {
-                fail(&format!("'{ip}' is not a valid IP address"));
+    match k {
+        "ignore" => {
+            for ip in v.split(',').filter(|s| !s.trim().is_empty()) {
+                if ip.trim().parse::<std::net::IpAddr>().is_err() {
+                    fail(&format!("'{ip}' is not a valid IP address"));
+                }
             }
         }
-    } else if v.parse::<f64>().is_err() {
-        fail(&format!("'{v}' is not a number"));
+        "webhook_url" => {
+            if !v.is_empty() {
+                webhook::parse_url(v).unwrap_or_else(|e| fail(&e));
+            }
+        }
+        "webhook_min_severity" if !["INFO", "MEDIUM", "HIGH"].contains(&v) => fail("webhook_min_severity must be INFO, MEDIUM or HIGH"),
+        "webhook_format" if !["auto", "slack", "discord", "generic"].contains(&v) => fail("webhook_format must be auto, slack, discord or generic"),
+        "webhook_min_severity" | "webhook_format" => {}
+        _ => {
+            if v.parse::<f64>().is_err() {
+                fail(&format!("'{v}' is not a number"));
+            }
+        }
     }
     let c = open_db(&dir_of(args));
     db::set_setting(&c, k, v).unwrap_or_else(|e| fail(&format!("{e}")));
-    println!("{k} = {v} (agents pick it up on their next report)");
+    if k.starts_with("webhook") || k == "down_after" {
+        println!("{k} = {} (applies immediately; restart not needed)", if k == "webhook_url" { webhook::mask(v) } else { v.to_string() });
+    } else {
+        println!("{k} = {v} (agents pick it up on their next report)");
+    }
 }
 
 fn config(args: &[String]) {
     let c = open_db(&dir_of(args));
-    for k in db::SETTING_KEYS.iter().chain(["down_after"].iter()) {
-        println!("{k:<16} {}", db::get_setting(&c, k).ok().flatten().unwrap_or_else(|| "(default)".into()));
+    for k in db::SETTING_KEYS.iter().chain(db::SERVER_KEYS.iter()) {
+        let v = db::get_setting(&c, k).ok().flatten();
+        let shown = match (*k, v) {
+            (_, None) => "(default)".to_string(),
+            ("webhook_url", Some(u)) if !u.is_empty() => webhook::mask(&u),
+            (_, Some(v)) => v,
+        };
+        println!("{k:<22} {shown}");
+    }
+}
+
+fn webhook_cmd(args: &[String]) {
+    if args.first().map(String::as_str) != Some("test") {
+        fail("usage: netwatch server webhook test");
+    }
+    let c = open_db(&dir_of(args));
+    let url = db::get_setting(&c, "webhook_url").ok().flatten().filter(|u| !u.is_empty())
+        .unwrap_or_else(|| fail("no webhook configured: netwatch server set webhook_url <url>"));
+    let n = Notification {
+        host: hostname(), ts: now_secs(), kind: "TEST".into(), severity: "INFO".into(), source: None,
+        message: "netwatch webhook test: delivery works".into(),
+    };
+    let fmt = webhook::effective_format(&c, &url);
+    match webhook::post(&url, &webhook::body(&fmt, &[n])) {
+        Ok(()) => println!("delivered to {} ({fmt} format)", webhook::mask(&url)),
+        Err(e) => fail(&format!("delivery to {} failed: {e}", webhook::mask(&url))),
     }
 }
 
 struct Shared {
+    notify: SyncSender<Notification>,
     cfg: Arc<rustls::ServerConfig>,
     dir: PathBuf,
     ca_pem: String,
@@ -183,10 +232,12 @@ fn run(args: &[String]) {
     let listener = TcpListener::bind(&listen).unwrap_or_else(|e| fail(&format!("cannot listen on {listen}: {e}")));
     println!("netwatch server listening on {listen} (data: {})", dir.display());
 
-    let shared = Arc::new(Shared { cfg, dir: dir.clone(), ca_pem, ca_key_pem, active: AtomicUsize::new(0), log: Mutex::new(log) });
+    let notify = webhook::spawn(db_path(&dir));
+    let shared = Arc::new(Shared { notify: notify.clone(), cfg, dir: dir.clone(), ca_pem, ca_key_pem, active: AtomicUsize::new(0), log: Mutex::new(log) });
 
     // Watchdog: HOST_DOWN detection + retention.
     let wd_dir = dir.clone();
+    let wd_notify = notify;
     std::thread::spawn(move || {
         let Ok(c) = db::open(&db_path(&wd_dir)) else { return };
         let mut ticks = 0u64;
@@ -194,7 +245,13 @@ fn run(args: &[String]) {
             std::thread::sleep(Duration::from_secs(15));
             let down_after = db::get_setting(&c, "down_after").ok().flatten().and_then(|v| v.parse().ok()).unwrap_or(90);
             match db::watchdog(&c, down_after) {
-                Ok(v) => v.iter().for_each(|n| println!("{} HOST_DOWN {n}", fmt_time(now_secs()))),
+                Ok(v) => v.iter().for_each(|n| {
+                    println!("{} HOST_DOWN {n}", fmt_time(now_secs()));
+                    let _ = wd_notify.try_send(Notification {
+                        host: n.clone(), ts: now_secs(), kind: "HOST_DOWN".into(), severity: "HIGH".into(), source: None,
+                        message: format!("no report from {n} for over {down_after}s"),
+                    });
+                }),
                 Err(e) => eprintln!("watchdog: {e}"),
             }
             ticks += 1;
@@ -253,8 +310,20 @@ fn handle(sh: &Shared, stream: TcpStream, peer: &str) -> std::io::Result<()> {
         let resp = match (req, &identity) {
             (Request::Enroll { token, hostname, csr_pem }, None) => enroll(sh, &dbc, peer, &token, &hostname, &csr_pem),
             (Request::Report(r), Some((id, name))) => match db::ingest(&mut dbc, id, peer, &r) {
-                Ok(changes) => {
+                Ok((changes, recovered)) => {
                     log_alerts(sh, name, &r);
+                    for a in &r.alerts {
+                        let _ = sh.notify.try_send(Notification {
+                            host: name.clone(), ts: a.ts, kind: clean(&a.kind, 32), severity: clean(&a.severity, 8),
+                            source: a.source.as_deref().map(|s| clean(s, 64)), message: clean(&a.message, 500),
+                        });
+                    }
+                    if recovered {
+                        let _ = sh.notify.try_send(Notification {
+                            host: name.clone(), ts: now_secs(), kind: "HOST_UP".into(), severity: "INFO".into(),
+                            source: None, message: "agent is reporting again".into(),
+                        });
+                    }
                     for a in &r.alerts {
                         println!("{} {name:<16} {:<6} {:<15} {}", fmt_time(a.ts), a.severity, a.kind, clean(&a.message, 200));
                     }

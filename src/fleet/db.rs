@@ -98,8 +98,8 @@ const MAX_LISTENERS: usize = 5000;
 const MAX_CONNS: usize = 3000;
 const MAX_ALERTS: usize = 200;
 
-/// Store one report. Returns the number of listener changes detected.
-pub fn ingest(c: &mut Connection, host: &str, addr: &str, r: &Report) -> Res<usize> {
+/// Store one report. Returns (listener changes detected, host just recovered from down).
+pub fn ingest(c: &mut Connection, host: &str, addr: &str, r: &Report) -> Res<(usize, bool)> {
     let now = now_secs() as i64;
     let tx = c.transaction()?;
 
@@ -189,7 +189,7 @@ pub fn ingest(c: &mut Connection, host: &str, addr: &str, r: &Report) -> Res<usi
         params![host, now, r.stats.established, r.stats.syn_recv, r.stats.time_wait, r.stats.listeners, r.stats.total],
     )?;
     tx.commit()?;
-    Ok(changes)
+    Ok((changes, prev_status == "down"))
 }
 
 /// Mark silent hosts down (and raise HOST_DOWN once). Returns hosts newly marked down.
@@ -215,8 +215,11 @@ pub fn prune(c: &Connection) -> Res<()> {
 
 // ---------- settings / config push ----------
 
+/// Settings pushed to agents.
 pub const SETTING_KEYS: &[&str] =
     &["report_interval", "window", "scan_ports", "rate_limit", "conn_limit", "syn_limit", "rst_rate", "ignore"];
+/// Settings used by the server itself.
+pub const SERVER_KEYS: &[&str] = &["down_after", "webhook_url", "webhook_min_severity", "webhook_format"];
 
 pub fn set_setting(c: &Connection, k: &str, v: &str) -> Res<()> {
     c.execute("INSERT INTO settings(key, value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=?2", params![k, v])?;

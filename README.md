@@ -87,6 +87,25 @@ sudo netwatch server set down_after 120    # seconds of silence before HOST_DOWN
 sudo netwatch server config
 ```
 
+### Webhook notifications
+
+The server can push alerts to Slack, Discord or any HTTP(S) endpoint:
+
+```sh
+sudo netwatch server set webhook_url https://hooks.slack.com/services/T000/B000/XXXX
+sudo netwatch server set webhook_min_severity HIGH     # INFO | MEDIUM (default) | HIGH
+sudo netwatch server set webhook_format auto           # auto | slack | discord | generic
+sudo netwatch server webhook test                      # send a test message
+```
+
+Applies immediately, no restart. Slack and Discord are auto-detected from the URL. The `generic` format POSTs JSON you can feed to anything:
+
+```json
+{"source":"netwatch","alerts":[{"time":"2026-11-11 18:22:25","host":"web-1","severity":"HIGH","type":"PORT_SCAN","source":"198.51.100.4","message":"…"}]}
+```
+
+Bursts are batched into one message, failed deliveries are retried (3 attempts), and a slow or dead endpoint never delays agent reports. `HOST_DOWN` and `HOST_UP` are sent too. The URL is treated as a secret: `server config` only shows its host. HTTPS works on any server (root certificates are bundled); redirects are not followed.
+
 Server-side alerts: `HOST_DOWN` (agent stopped reporting) and `HOST_UP`. The server also appends every alert to `/var/lib/netwatch-server/alerts.jsonl`, ready to ship to a SIEM.
 
 ### Security model

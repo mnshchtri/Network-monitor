@@ -8,3 +8,4 @@ pub mod proto;
 pub mod server;
 pub mod tui;
 pub mod util;
+pub mod webhook;
