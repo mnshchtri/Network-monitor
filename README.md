@@ -113,7 +113,7 @@ HTTPS turns on HSTS and `Secure` cookies. Behind your own TLS proxy instead, use
 | Role | Can |
 |---|---|
 | `viewer` | See hosts, alerts, ports, connections, changes |
-| `operator` | + acknowledge alerts |
+| `operator` | + acknowledge, assign and comment on alerts; edit host tags; start/end maintenance windows |
 | `admin` | + audit log (view/export), see and revoke everyone's sessions |
 
 Roles are checked on the server for every request and take effect immediately, including for sessions that are already open. **Accounts are managed only from the server's command line**, so a hijacked dashboard session can never create admins or change roles:
@@ -137,6 +137,23 @@ The last enabled admin cannot be disabled, demoted or deleted. Upgrading from a 
 - Sessions: `HttpOnly` + `SameSite=Strict` cookie, 30-minute idle timeout and 8-hour lifetime (`--idle-minutes`, `--session-hours`), "sign out everywhere", changing a password ends your other sessions.
 - Lockout: 5 failed logins from one IP or 10 for one account locks it for 5 minutes. (Per-account lockout means someone who knows a username can lock that user out for 5 minutes; that is the usual trade-off against guessing.)
 - Host-header allowlist (DNS rebinding), CSRF header and Origin checks, strict Content-Security-Policy with no third-party assets, agent-supplied text rendered as text, never HTML.
+
+#### Working with many hosts
+
+- **Tags and groups.** Operators tag hosts (`prod`, `db`, `eu-west`; up to 10 per host, `a-z 0-9 - .`) from the host page. Tag chips at the top of the sidebar filter the host list and the alert feed.
+- **Search.** The box in the header searches hosts, tags, listening ports (exact port numbers match: type `3306` to see every host listening on MySQL), processes, IP addresses, connections and alerts. Click a result to jump to it.
+- **Alert workflow.** Click an alert to open it: assign it to a user, add notes (kept with the alert, shown as plain text), acknowledge it. Filter the feed by time range, severity and "assigned to me"; export the filtered view as CSV or JSON.
+- **Trends.** Per-host charts for 1h / 6h / 24h / 7d with real axes and a hover read-out: established connections, half-open `SYN_RECV` (a flood is obvious here), `TIME_WAIT` and listening sockets. Each point is the *maximum* in its bucket, so a short spike is never averaged away. History is kept for 7 days.
+- **Timeline.** One chronological stream per host: alerts, host up/down, ports opened and closed.
+- **Maintenance windows.** Mute a host and/or an alert type for 5 minutes to 7 days (a reason is required and goes to the audit log). Muted alerts are **still recorded and shown** (marked `muted`) but don't count as open alerts and aren't sent to the webhook, so nothing is lost for later investigation. Operators and admins can start and end windows.
+
+#### Prometheus metrics
+
+```sh
+sudo netwatch server metrics-token     # prints a bearer token once; only its hash is stored
+```
+
+Then scrape `GET /metrics` on the dashboard port with `Authorization: Bearer <token>` (the command prints a ready-made `prometheus.yml` snippet). Per-host gauges: `netwatch_host_up`, `netwatch_established_connections`, `netwatch_syn_recv_connections`, `netwatch_time_wait_connections`, `netwatch_listening_sockets`, `netwatch_open_alerts`, `netwatch_host_last_seen_timestamp_seconds`. The endpoint is off until you create a token; running the command again rotates it and `--disable` turns it off. If the dashboard is on a public name, pass `--allow-host` for it.
 
 #### Audit log
 

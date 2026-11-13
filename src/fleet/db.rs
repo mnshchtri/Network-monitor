@@ -14,8 +14,22 @@ pub fn open(path: &Path) -> Res<Connection> {
     c.pragma_update(None, "journal_mode", "WAL")?;
     c.pragma_update(None, "synchronous", "NORMAL")?;
     c.execute_batch(SCHEMA)?;
+    // Columns added after the first release. Errors are ignored on purpose: a concurrent process
+    // may have added the column between our check and the ALTER.
+    add_column(&c, "hosts", "tags", "TEXT NOT NULL DEFAULT ''");
+    add_column(&c, "alerts", "assignee", "TEXT");
+    add_column(&c, "alerts", "muted", "INTEGER NOT NULL DEFAULT 0");
     migrate_users(&c)?;
     Ok(c)
+}
+
+fn add_column(c: &Connection, table: &str, col: &str, decl: &str) {
+    let have: i64 = c
+        .query_row("SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2", params![table, col], |r| r.get(0))
+        .unwrap_or(1);
+    if have == 0 {
+        let _ = c.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl}"), []);
+    }
 }
 
 /// Older versions had a single shared dashboard password. Turn it into the first admin account
@@ -64,6 +78,12 @@ CREATE TABLE IF NOT EXISTS metrics(
   time_wait INTEGER, listeners INTEGER, total INTEGER);
 CREATE INDEX IF NOT EXISTS metrics_host ON metrics(host_id, ts DESC);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS alert_comments(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, alert_id INTEGER NOT NULL, ts INTEGER NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS comments_alert ON alert_comments(alert_id);
+CREATE TABLE IF NOT EXISTS mutes(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, host_id TEXT, kind TEXT, until INTEGER NOT NULL, reason TEXT NOT NULL,
+  created_by TEXT NOT NULL, created INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS users(
   id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL COLLATE NOCASE, pw_hash TEXT NOT NULL,
   role TEXT NOT NULL, disabled INTEGER NOT NULL DEFAULT 0, must_change INTEGER NOT NULL DEFAULT 0,
@@ -112,9 +132,11 @@ pub fn revoke(c: &Connection, id_or_name: &str) -> Res<usize> {
 // ---------- ingestion ----------
 
 pub fn insert_alert(c: &Connection, host: &str, ts: u64, kind: &str, sev: &str, src: Option<&str>, msg: &str) -> Res<()> {
+    let kind = clean(kind, 32);
+    let muted = is_muted(c, host, &kind)? as i64;
     c.execute(
-        "INSERT INTO alerts(host_id, ts, kind, severity, source, message) VALUES(?1,?2,?3,?4,?5,?6)",
-        params![host, ts as i64, clean(kind, 32), clean(sev, 8), src.map(|s| clean(s, 64)), clean(msg, 500)],
+        "INSERT INTO alerts(host_id, ts, kind, severity, source, message, muted) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![host, ts as i64, kind, clean(sev, 8), src.map(|s| clean(s, 64)), clean(msg, 500), muted],
     )?;
     Ok(())
 }
@@ -131,9 +153,10 @@ pub fn ingest(c: &mut Connection, host: &str, addr: &str, r: &Report) -> Res<(us
     let (was_baselined, prev_status): (i64, String) =
         tx.query_row("SELECT baselined, status FROM hosts WHERE id = ?1", [host], |r| Ok((r.get(0)?, r.get(1)?)))?;
     if prev_status == "down" {
+        let muted = is_muted(&tx, host, "HOST_UP")? as i64;
         tx.execute(
-            "INSERT INTO alerts(host_id, ts, kind, severity, message) VALUES(?1,?2,'HOST_UP','INFO','agent is reporting again')",
-            params![host, now],
+            "INSERT INTO alerts(host_id, ts, kind, severity, message, muted) VALUES(?1,?2,'HOST_UP','INFO','agent is reporting again',?3)",
+            params![host, now, muted],
         )?;
     }
 
@@ -203,9 +226,11 @@ pub fn ingest(c: &mut Connection, host: &str, addr: &str, r: &Report) -> Res<(us
     for a in r.alerts.iter().take(MAX_ALERTS) {
         // Never accept timestamps from the future or absurdly old; fall back to receive time.
         let ts = if a.ts > now_secs() + 60 || a.ts + 7 * 86400 < now_secs() { now_secs() } else { a.ts };
+        let kind = clean(&a.kind, 32);
+        let muted = is_muted(&tx, host, &kind)? as i64;
         tx.execute(
-            "INSERT INTO alerts(host_id, ts, kind, severity, source, message) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![host, ts as i64, clean(&a.kind, 32), clean(&a.severity, 8), a.source.as_deref().map(|s| clean(s, 64)), clean(&a.message, 500)],
+            "INSERT INTO alerts(host_id, ts, kind, severity, source, message, muted) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![host, ts as i64, kind, clean(&a.severity, 8), a.source.as_deref().map(|s| clean(s, 64)), clean(&a.message, 500), muted],
         )?;
     }
 
@@ -287,13 +312,14 @@ pub struct HostRow {
     pub time_wait: u32,
     pub listeners: u32,
     pub open_alerts: u32,
+    pub tags: Vec<String>,
 }
 
 pub fn hosts(c: &Connection) -> Res<Vec<HostRow>> {
     let mut st = c.prepare(
         "SELECT h.id, h.name, h.os, h.version, h.remote_addr, h.status, h.last_seen, h.is_root, h.total,
                 h.established, h.syn_recv, h.time_wait, h.listeners,
-                (SELECT COUNT(*) FROM alerts a WHERE a.host_id = h.id AND a.acked = 0 AND a.severity != 'INFO')
+                (SELECT COUNT(*) FROM alerts a WHERE a.host_id = h.id AND a.acked = 0 AND a.severity != 'INFO' AND a.muted = 0), h.tags
          FROM hosts h WHERE h.revoked = 0 ORDER BY (h.status = 'down') DESC, 14 DESC, h.name",
     )?;
     let rows = st.query_map([], |r| {
@@ -302,6 +328,7 @@ pub fn hosts(c: &Connection) -> Res<Vec<HostRow>> {
             status: r.get(5)?, last_seen: r.get::<_, i64>(6)? as u64, is_root: r.get::<_, i64>(7)? != 0,
             total: r.get(8)?, established: r.get(9)?, syn_recv: r.get(10)?, time_wait: r.get(11)?,
             listeners: r.get(12)?, open_alerts: r.get(13)?,
+            tags: r.get::<_, String>(14)?.split(',').filter(|t| !t.is_empty()).map(String::from).collect(),
         })
     })?;
     rows.collect()
@@ -316,24 +343,219 @@ pub struct AlertRow {
     pub severity: String,
     pub message: String,
     pub acked: bool,
+    pub assignee: String,
+    pub muted: bool,
 }
 
 pub fn alerts(c: &Connection, host: Option<&str>, include_acked: bool, limit: usize) -> Res<Vec<AlertRow>> {
-    let mut st = c.prepare(
-        "SELECT a.id, COALESCE(h.name, a.host_id), a.ts, a.kind, a.severity, a.message, a.acked
-         FROM alerts a LEFT JOIN hosts h ON h.id = a.host_id
-         WHERE (?1 IS NULL OR a.host_id = ?1) AND (?2 = 1 OR a.acked = 0)
-         ORDER BY a.ts DESC, a.id DESC LIMIT ?3",
+    alerts_filtered(c, &AlertFilter { host, include_acked, limit, ..Default::default() })
+}
+
+#[derive(Default)]
+pub struct AlertFilter<'a> {
+    pub host: Option<&'a str>,
+    pub tag: Option<&'a str>,
+    pub include_acked: bool,
+    pub since: u64,
+    pub severity: Option<&'a str>,
+    pub kind: Option<&'a str>,
+    pub assignee: Option<&'a str>,
+    pub limit: usize,
+}
+
+const ALERT_COLS: &str = "a.id, COALESCE(h.name, a.host_id), a.ts, a.kind, a.severity, a.message, a.acked, COALESCE(a.assignee,''), a.muted";
+
+fn alert_row(r: &rusqlite::Row) -> Res<AlertRow> {
+    Ok(AlertRow {
+        id: r.get(0)?, host: r.get(1)?, ts: r.get::<_, i64>(2)? as u64, kind: r.get(3)?, severity: r.get(4)?,
+        message: r.get(5)?, acked: r.get::<_, i64>(6)? != 0, assignee: r.get(7)?, muted: r.get::<_, i64>(8)? != 0,
+    })
+}
+
+pub fn alerts_filtered(c: &Connection, f: &AlertFilter) -> Res<Vec<AlertRow>> {
+    let mut st = c.prepare(&format!(
+        "SELECT {ALERT_COLS} FROM alerts a LEFT JOIN hosts h ON h.id = a.host_id
+         WHERE (?1 IS NULL OR a.host_id = ?1)
+           AND (?2 IS NULL OR (',' || COALESCE(h.tags,'') || ',') LIKE '%,' || ?2 || ',%')
+           AND (?3 = 1 OR a.acked = 0) AND a.ts >= ?4
+           AND (?5 IS NULL OR a.severity = ?5) AND (?6 IS NULL OR a.kind = ?6) AND (?7 IS NULL OR a.assignee = ?7)
+         ORDER BY a.ts DESC, a.id DESC LIMIT ?8"
+    ))?;
+    let rows = st.query_map(
+        params![f.host, f.tag, f.include_acked as i64, f.since as i64, f.severity, f.kind, f.assignee, f.limit.max(1) as i64],
+        alert_row,
     )?;
-    let rows = st.query_map(params![host, include_acked as i64, limit as i64], |r| {
-        Ok(AlertRow {
-            id: r.get(0)?, host: r.get(1)?, ts: r.get::<_, i64>(2)? as u64, kind: r.get(3)?, severity: r.get(4)?,
-            message: r.get(5)?, acked: r.get::<_, i64>(6)? != 0,
+    rows.collect()
+}
+
+pub fn alert_by_id(c: &Connection, id: i64) -> Res<Option<AlertRow>> {
+    c.query_row(&format!("SELECT {ALERT_COLS} FROM alerts a LEFT JOIN hosts h ON h.id = a.host_id WHERE a.id = ?1"), [id], alert_row).optional()
+}
+
+pub fn set_assignee(c: &Connection, id: i64, who: Option<&str>) -> Res<usize> {
+    c.execute("UPDATE alerts SET assignee = ?2 WHERE id = ?1", params![id, who])
+}
+
+pub fn add_comment(c: &Connection, alert_id: i64, author: &str, body: &str) -> Res<()> {
+    c.execute(
+        "INSERT INTO alert_comments(alert_id, ts, author, body) VALUES(?1,?2,?3,?4)",
+        params![alert_id, now_secs() as i64, clean(author, 32), body.chars().filter(|ch| !ch.is_control() || *ch == '\n').take(1000).collect::<String>()],
+    )?;
+    Ok(())
+}
+
+pub fn comments(c: &Connection, alert_id: i64) -> Res<Vec<(u64, String, String)>> {
+    let mut st = c.prepare("SELECT ts, author, body FROM alert_comments WHERE alert_id = ?1 ORDER BY id")?;
+    let rows = st.query_map([alert_id], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?)))?;
+    rows.collect()
+}
+
+// ---------- host tags ----------
+
+pub fn valid_tag(t: &str) -> bool {
+    !t.is_empty() && t.len() <= 24 && t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+}
+
+pub fn set_tags(c: &Connection, host: &str, tags: &[String]) -> Res<usize> {
+    c.execute("UPDATE hosts SET tags = ?2 WHERE id = ?1", params![host, tags.join(",")])
+}
+
+// ---------- maintenance mutes ----------
+
+#[derive(Clone, Debug)]
+pub struct MuteRow {
+    pub id: i64,
+    pub host_id: Option<String>,
+    pub host: String,
+    pub kind: Option<String>,
+    pub until: u64,
+    pub reason: String,
+    pub created_by: String,
+    pub created: u64,
+    pub active: bool,
+}
+
+/// True when an unexpired, un-ended mute covers this host and alert kind.
+pub fn is_muted(c: &Connection, host: &str, kind: &str) -> Res<bool> {
+    let n: i64 = c.query_row(
+        "SELECT COUNT(*) FROM mutes WHERE ended = 0 AND until > ?1 AND (host_id IS NULL OR host_id = ?2) AND (kind IS NULL OR kind = ?3)",
+        params![now_secs() as i64, host, kind],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+pub fn add_mute(c: &Connection, host: Option<&str>, kind: Option<&str>, minutes: u64, reason: &str, by: &str) -> Res<()> {
+    let now = now_secs() as i64;
+    c.execute(
+        "INSERT INTO mutes(host_id, kind, until, reason, created_by, created) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![host, kind, now + (minutes * 60) as i64, clean(reason, 200), clean(by, 32), now],
+    )?;
+    Ok(())
+}
+
+pub fn end_mute(c: &Connection, id: i64) -> Res<usize> {
+    c.execute("UPDATE mutes SET ended = 1 WHERE id = ?1 AND ended = 0", [id])
+}
+
+pub fn mutes(c: &Connection) -> Res<Vec<MuteRow>> {
+    let now = now_secs();
+    let mut st = c.prepare(
+        "SELECT m.id, m.host_id, COALESCE(h.name, ''), m.kind, m.until, m.reason, m.created_by, m.created, m.ended
+         FROM mutes m LEFT JOIN hosts h ON h.id = m.host_id ORDER BY m.id DESC LIMIT 200",
+    )?;
+    let rows = st.query_map([], |r| {
+        let (until, ended): (i64, i64) = (r.get(4)?, r.get(8)?);
+        Ok(MuteRow {
+            id: r.get(0)?, host_id: r.get(1)?, host: r.get(2)?, kind: r.get(3)?, until: until as u64, reason: r.get(5)?,
+            created_by: r.get(6)?, created: r.get::<_, i64>(7)? as u64, active: ended == 0 && until as u64 > now,
         })
     })?;
     rows.collect()
 }
 
+// ---------- trends, timeline, search ----------
+
+/// Time-bucketed MAX per metric (max, not average, so short spikes such as a SYN burst survive).
+/// Returns (bucket start, established, syn_recv, time_wait, listeners) oldest first.
+pub fn metric_series(c: &Connection, host: &str, since: u64, bucket: u64) -> Res<Vec<(u64, u32, u32, u32, u32)>> {
+    let bucket = bucket.max(1) as i64;
+    let mut st = c.prepare(
+        "SELECT (ts / ?3) * ?3, MAX(established), MAX(syn_recv), MAX(time_wait), MAX(listeners) FROM metrics
+         WHERE host_id = ?1 AND ts >= ?2 GROUP BY 1 ORDER BY 1",
+    )?;
+    let rows = st.query_map(params![host, since as i64, bucket], |r| {
+        Ok((r.get::<_, i64>(0)? as u64, r.get::<_, Option<u32>>(1)?.unwrap_or(0), r.get::<_, Option<u32>>(2)?.unwrap_or(0), r.get::<_, Option<u32>>(3)?.unwrap_or(0), r.get::<_, Option<u32>>(4)?.unwrap_or(0)))
+    })?;
+    rows.collect()
+}
+
+#[derive(Clone, Debug)]
+pub struct TimelineRow {
+    pub ts: u64,
+    pub kind: String,
+    pub severity: String,
+    pub title: String,
+    pub detail: String,
+}
+
+/// Everything that happened on a host, newest first: alerts (including HOST_DOWN/UP) and listener changes.
+pub fn timeline(c: &Connection, host: &str, limit: usize) -> Res<Vec<TimelineRow>> {
+    let mut st = c.prepare(
+        "SELECT ts, 'alert', severity, kind, message || CASE WHEN muted = 1 THEN '  [muted]' ELSE '' END FROM alerts WHERE host_id = ?1
+         UNION ALL
+         SELECT ts, 'listener', CASE event WHEN 'opened' THEN 'MEDIUM' ELSE 'INFO' END, 'PORT ' || upper(event),
+                trim(COALESCE(proto,'') || ' ' || COALESCE(addr,'') || ':' || COALESCE(port,0) || ' ' || COALESCE(process,''))
+         FROM listener_events WHERE host_id = ?1
+         ORDER BY 1 DESC LIMIT ?2",
+    )?;
+    let rows = st.query_map(params![host, limit as i64], |r| {
+        Ok(TimelineRow { ts: r.get::<_, i64>(0)? as u64, kind: r.get(1)?, severity: r.get(2)?, title: r.get(3)?, detail: r.get(4)? })
+    })?;
+    rows.collect()
+}
+
+#[derive(Default)]
+pub struct SearchResults {
+    pub hosts: Vec<(String, String, String, Vec<String>)>,
+    pub listeners: Vec<(String, String, String, String, u16, String, String)>,
+    pub conns: Vec<(String, String, String, String, String, String, String)>,
+    pub alerts: Vec<AlertRow>,
+}
+
+fn like(q: &str) -> String {
+    format!("%{}%", q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+}
+
+pub fn search(c: &Connection, q: &str) -> Res<SearchResults> {
+    let (pat, exact) = (like(q), q.to_string());
+    let mut out = SearchResults::default();
+    let mut st = c.prepare(
+        "SELECT id, name, remote_addr, tags FROM hosts WHERE revoked = 0 AND (name LIKE ?1 ESCAPE '\\' OR remote_addr LIKE ?1 ESCAPE '\\' OR (',' || tags || ',') LIKE ?1 ESCAPE '\\' OR os LIKE ?1 ESCAPE '\\') LIMIT 50",
+    )?;
+    out.hosts = st
+        .query_map([&pat], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?.split(',').filter(|t| !t.is_empty()).map(String::from).collect())))?
+        .collect::<Res<_>>()?;
+    let mut st = c.prepare(
+        "SELECT l.host_id, COALESCE(h.name,''), l.proto, l.addr, l.port, COALESCE(l.process,''), COALESCE(l.user,'') FROM listeners l
+         LEFT JOIN hosts h ON h.id = l.host_id
+         WHERE h.revoked = 0 AND (CAST(l.port AS TEXT) = ?2 OR l.addr LIKE ?1 ESCAPE '\\' OR l.process LIKE ?1 ESCAPE '\\' OR l.user LIKE ?1 ESCAPE '\\')
+         ORDER BY l.port LIMIT 100",
+    )?;
+    out.listeners = st.query_map(params![pat, exact], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<Res<_>>()?;
+    let mut st = c.prepare(
+        "SELECT n.host_id, COALESCE(h.name,''), n.proto, n.state, n.local, n.remote, COALESCE(n.process,'') FROM conns n
+         LEFT JOIN hosts h ON h.id = n.host_id
+         WHERE h.revoked = 0 AND (n.local LIKE ?1 ESCAPE '\\' OR n.remote LIKE ?1 ESCAPE '\\' OR n.process LIKE ?1 ESCAPE '\\') LIMIT 100",
+    )?;
+    out.conns = st.query_map([&pat], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<Res<_>>()?;
+    let mut st = c.prepare(&format!(
+        "SELECT {ALERT_COLS} FROM alerts a LEFT JOIN hosts h ON h.id = a.host_id
+         WHERE a.message LIKE ?1 ESCAPE '\\' OR a.kind LIKE ?1 ESCAPE '\\' OR a.source LIKE ?1 ESCAPE '\\' ORDER BY a.ts DESC LIMIT 50"
+    ))?;
+    out.alerts = st.query_map([&pat], alert_row)?.collect::<Res<_>>()?;
+    Ok(out)
+}
 pub fn ack(c: &Connection, id: i64) -> Res<()> {
     c.execute("UPDATE alerts SET acked = 1 WHERE id = ?1", [id])?;
     Ok(())

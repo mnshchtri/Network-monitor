@@ -186,7 +186,7 @@ fn read_req(s: &mut impl Read) -> Result<Req, &'static str> {
     }
     body.truncate(clen);
     let (path, qs) = target.split_once('?').unwrap_or((target, ""));
-    let query = qs.split('&').filter_map(|p| p.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    let query = qs.split('&').filter_map(|p| p.split_once('=')).map(|(k, v)| (k.to_string(), url_decode(v))).collect();
     Ok(Req { method: method.to_string(), path: path.to_string(), query, headers, body })
 }
 
@@ -245,6 +245,112 @@ fn csv_cell(s: &str) -> String {
     format!("\"{t}\"")
 }
 
+fn hex_val(b: u8) -> Option<u8> {
+    (b as char).to_digit(16).map(|d| d as u8)
+}
+
+/// Percent-decoding that works on bytes only: malformed or non-ASCII input can never panic
+/// (the release build aborts on panic, so one bad request must not be able to reach one).
+fn url_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let (mut out, mut i) = (Vec::with_capacity(b.len()), 0);
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' => match (b.get(i + 1).and_then(|c| hex_val(*c)), b.get(i + 2).and_then(|c| hex_val(*c))) {
+                (Some(h), Some(l)) => {
+                    out.push(h * 16 + l);
+                    i += 2;
+                }
+                _ => out.push(b'%'),
+            },
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn valid_kind(k: &str) -> bool {
+    !k.is_empty() && k.len() <= 32 && k.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+}
+
+fn parse_filter<'a>(req: &'a Req, me: &'a User) -> Result<db::AlertFilter<'a>, &'static str> {
+    let q = |k: &str| req.query.get(k).map(String::as_str).filter(|v| !v.is_empty());
+    let host = q("host");
+    if host.map_or(false, |h| !valid_id(h)) {
+        return Err("bad host id");
+    }
+    let tag = q("tag");
+    if tag.map_or(false, |t| !db::valid_tag(t)) {
+        return Err("bad tag");
+    }
+    let severity = q("severity");
+    if severity.map_or(false, |v| !["INFO", "MEDIUM", "HIGH"].contains(&v)) {
+        return Err("bad severity");
+    }
+    let kind = q("kind");
+    if kind.map_or(false, |k| !valid_kind(k)) {
+        return Err("bad kind");
+    }
+    let assignee = match q("assignee") {
+        Some("me") => Some(me.username.as_str()),
+        Some(n) if auth::valid_username(n) => Some(n),
+        Some(_) => return Err("bad assignee"),
+        None => None,
+    };
+    Ok(db::AlertFilter {
+        host,
+        tag,
+        include_acked: q("all") == Some("1"),
+        since: q("since").and_then(|v| v.parse().ok()).unwrap_or(0),
+        severity,
+        kind,
+        assignee,
+        limit: q("limit").and_then(|v| v.parse().ok()).unwrap_or(300usize).clamp(1, 20000),
+    })
+}
+
+fn prom_label(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+}
+
+fn metrics(st: &State, c: &rusqlite::Connection, s: &mut impl Write, req: &Req) {
+    let stored = db::get_setting(c, "metrics_token_hash").ok().flatten().unwrap_or_default();
+    if stored.is_empty() {
+        return err(s, 404, "metrics endpoint is not enabled (netwatch server metrics-token)");
+    }
+    let presented = req.h("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
+    if !auth::ct_eq(sha256_hex(presented.as_bytes()).as_bytes(), stored.as_bytes()) {
+        return send(s, 401, "text/plain", "no-store", &["WWW-Authenticate: Bearer".into()], b"unauthorized\n");
+    }
+    let _ = st;
+    let hosts = match db::hosts(c) {
+        Ok(h) => h,
+        Err(e) => return err(s, 500, &format!("database: {e}")),
+    };
+    let mut o = String::new();
+    let mut gauge = |name: &str, help: &str, f: &dyn Fn(&db::HostRow) -> f64| {
+        o.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
+        for h in &hosts {
+            o.push_str(&format!("{name}{{host=\"{}\",id=\"{}\"}} {}\n", prom_label(&h.name), h.id, f(h)));
+        }
+    };
+    gauge("netwatch_host_up", "1 if the agent is reporting, 0 if it has gone silent", &|h| (h.status == "up") as u8 as f64);
+    gauge("netwatch_host_last_seen_timestamp_seconds", "Unix time of the last report", &|h| h.last_seen as f64);
+    gauge("netwatch_established_connections", "TCP connections in ESTABLISHED", &|h| h.established as f64);
+    gauge("netwatch_syn_recv_connections", "Half-open TCP connections (SYN_RECV)", &|h| h.syn_recv as f64);
+    gauge("netwatch_time_wait_connections", "TCP connections in TIME_WAIT", &|h| h.time_wait as f64);
+    gauge("netwatch_listening_sockets", "Listening sockets", &|h| h.listeners as f64);
+    gauge("netwatch_open_alerts", "Unacknowledged, un-muted MEDIUM/HIGH alerts", &|h| h.open_alerts as f64);
+    send(s, 200, "text/plain; version=0.0.4; charset=utf-8", "no-store", &[], o.as_bytes());
+}
+
+fn alert_json_full(a: &db::AlertRow) -> Value {
+    json!({"id": a.id, "host": a.host, "ts": a.ts, "kind": a.kind, "severity": a.severity, "message": a.message,
+           "acked": a.acked, "assignee": a.assignee, "muted": a.muted})
+}
+
 // ---------- request handling ----------
 
 struct Authed {
@@ -290,13 +396,16 @@ fn handle<S: Read + Write>(st: &State, s: &mut S, peer: IpAddr) {
         ("GET", "/app.js") => return send(s, 200, "text/javascript; charset=utf-8", "no-cache", &[], JS.as_bytes()),
         _ => {}
     }
-    if !req.path.starts_with("/api/") {
+    if !req.path.starts_with("/api/") && req.path != "/metrics" {
         return err(s, 404, "not found");
     }
     let conn = match db::open(&st.dir.join("netwatch.db")) {
         Ok(c) => c,
         Err(e) => return err(s, 500, &format!("database: {e}")),
     };
+    if req.method == "GET" && req.path == "/metrics" {
+        return metrics(st, &conn, s, &req);
+    }
     if req.method == "POST" && req.path == "/api/login" {
         return login(st, &conn, s, &req, peer);
     }
@@ -380,11 +489,11 @@ fn login(st: &State, c: &rusqlite::Connection, s: &mut impl Write, req: &Req, pe
 fn host_json(h: &db::HostRow) -> Value {
     json!({"id": h.id, "name": h.name, "os": h.os, "version": h.version, "addr": h.addr, "status": h.status,
            "last_seen": h.last_seen, "is_root": h.is_root, "total": h.total, "established": h.established,
-           "syn_recv": h.syn_recv, "time_wait": h.time_wait, "listeners": h.listeners, "open_alerts": h.open_alerts})
+           "syn_recv": h.syn_recv, "time_wait": h.time_wait, "listeners": h.listeners, "open_alerts": h.open_alerts, "tags": h.tags})
 }
 
 fn alert_json(a: &db::AlertRow) -> Value {
-    json!({"id": a.id, "host": a.host, "ts": a.ts, "kind": a.kind, "severity": a.severity, "message": a.message, "acked": a.acked})
+    alert_json_full(a)
 }
 
 fn route(st: &State, c: &rusqlite::Connection, req: &Req, s: &mut impl Write, a: &Authed, ip: IpAddr) -> rusqlite::Result<()> {
@@ -463,33 +572,195 @@ fn route(st: &State, c: &rusqlite::Connection, req: &Req, s: &mut impl Write, a:
             json_resp(s, 200, json!({"hosts": hosts.iter().map(host_json).collect::<Vec<_>>(), "open_alerts": open, "now": now_secs()}));
         }
         ("GET", "/api/alerts") => {
-            let host = req.query.get("host").filter(|h| !h.is_empty());
-            if host.map_or(false, |h| !valid_id(h)) {
-                return Ok(err(s, 400, "bad host id"));
-            }
-            let all = req.query.get("all").map_or(false, |v| v == "1");
-            let limit = req.query.get("limit").and_then(|v| v.parse().ok()).unwrap_or(300usize).clamp(1, 1000);
-            let rows = db::alerts(c, host.map(String::as_str), all, limit)?;
+            let f = match parse_filter(req, me) {
+                Ok(f) => f,
+                Err(m) => return Ok(err(s, 400, m)),
+            };
+            let rows = db::alerts_filtered(c, &f)?;
             json_resp(s, 200, json!({"alerts": rows.iter().map(alert_json).collect::<Vec<_>>()}));
         }
+        ("GET", "/api/alerts/export") => {
+            let mut f = match parse_filter(req, me) {
+                Ok(f) => f,
+                Err(m) => return Ok(err(s, 400, m)),
+            };
+            f.limit = f.limit.max(5000);
+            let rows = db::alerts_filtered(c, &f)?;
+            let json_fmt = req.query.get("format").map(String::as_str) == Some("json");
+            audit(st, c, &me.username, "alerts.export", if json_fmt { "json" } else { "csv" }, &format!("{} rows", rows.len()), ip);
+            if json_fmt {
+                send(s, 200, "application/json", "no-store", &["Content-Disposition: attachment; filename=\"netwatch-alerts.json\"".into()], json!({"alerts": rows.iter().map(alert_json).collect::<Vec<_>>()}).to_string().as_bytes());
+            } else {
+                let mut out = String::from("id,time_utc,host,severity,type,message,acknowledged,assignee,muted\n");
+                for r in &rows {
+                    out.push_str(&format!("{},{},{},{},{},{},{},{},{}\n", r.id, csv_cell(&fmt_time(r.ts)), csv_cell(&r.host), r.severity, csv_cell(&r.kind), csv_cell(&r.message), r.acked, csv_cell(&r.assignee), r.muted));
+                }
+                send(s, 200, "text/csv; charset=utf-8", "no-store", &["Content-Disposition: attachment; filename=\"netwatch-alerts.csv\"".into()], out.as_bytes());
+            }
+        }
+        ("GET", p) if p.starts_with("/api/alert/") => {
+            let Ok(id) = p["/api/alert/".len()..].parse::<i64>() else { return Ok(err(s, 400, "bad alert id")) };
+            let Some(a) = db::alert_by_id(c, id)? else { return Ok(err(s, 404, "no such alert")) };
+            let cm = db::comments(c, id)?;
+            json_resp(s, 200, json!({"alert": alert_json_full(&a), "comments": cm.iter().map(|(ts, who, body)| json!({"ts": ts, "author": who, "body": body})).collect::<Vec<_>>()}));
+        }
+        ("POST", "/api/alert/assign") => {
+            if rank < role_rank("operator") {
+                return Ok(forbidden(s));
+            }
+            let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let Some(id) = v["id"].as_i64() else { return Ok(err(s, 400, "missing alert id")) };
+            let who = v["assignee"].as_str().filter(|x| !x.is_empty());
+            if let Some(w) = who {
+                match db::user_by_name(c, w)? {
+                    Some(u) if !u.disabled => {}
+                    _ => return Ok(err(s, 400, "no such active user")),
+                }
+            }
+            if db::set_assignee(c, id, who)? == 0 {
+                return Ok(err(s, 404, "no such alert"));
+            }
+            audit(st, c, &me.username, "alert.assign", &id.to_string(), who.unwrap_or("(unassigned)"), ip);
+            json_resp(s, 200, json!({"ok": true}));
+        }
+        ("POST", "/api/alert/comment") => {
+            if rank < role_rank("operator") {
+                return Ok(forbidden(s));
+            }
+            let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let (Some(id), Some(body)) = (v["id"].as_i64(), v["body"].as_str().map(str::trim).filter(|b| !b.is_empty())) else {
+                return Ok(err(s, 400, "a comment needs an alert id and text"));
+            };
+            if db::alert_by_id(c, id)?.is_none() {
+                return Ok(err(s, 404, "no such alert"));
+            }
+            db::add_comment(c, id, &me.username, body)?;
+            audit(st, c, &me.username, "alert.comment", &id.to_string(), &format!("{} characters", body.chars().count().min(1000)), ip);
+            json_resp(s, 200, json!({"ok": true}));
+        }
+        ("GET", "/api/users") => {
+            if rank < role_rank("operator") {
+                return Ok(forbidden(s));
+            }
+            let list: Vec<Value> = db::users(c)?.iter().filter(|u| !u.disabled).map(|u| json!({"username": u.username, "role": u.role})).collect();
+            json_resp(s, 200, json!({"users": list}));
+        }
+        ("GET", "/api/search") => {
+            let q = req.query.get("q").map(|v| v.trim().to_string()).unwrap_or_default();
+            if q.chars().count() < 2 || q.chars().count() > 64 {
+                return Ok(err(s, 400, "search needs 2 to 64 characters"));
+            }
+            let r = db::search(c, &q)?;
+            json_resp(s, 200, json!({
+                "hosts": r.hosts.iter().map(|(id, name, addr, tags)| json!({"id": id, "name": name, "addr": addr, "tags": tags})).collect::<Vec<_>>(),
+                "listeners": r.listeners.iter().map(|(hid, h, proto, addr, port, process, user)| json!({"host_id": hid, "host": h, "proto": proto, "addr": addr, "port": port, "process": process, "user": user})).collect::<Vec<_>>(),
+                "conns": r.conns.iter().map(|(hid, h, proto, state, local, remote, process)| json!({"host_id": hid, "host": h, "proto": proto, "state": state, "local": local, "remote": remote, "process": process})).collect::<Vec<_>>(),
+                "alerts": r.alerts.iter().map(alert_json_full).collect::<Vec<_>>(),
+            }));
+        }
+        ("POST", "/api/host/tags") => {
+            if rank < role_rank("operator") {
+                return Ok(forbidden(s));
+            }
+            let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let id = v["id"].as_str().unwrap_or("");
+            let mut tags: Vec<String> = v["tags"].as_array().map(|a| a.iter().filter_map(|t| t.as_str()).map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).collect()).unwrap_or_default();
+            tags.sort();
+            tags.dedup();
+            if !valid_id(id) || tags.len() > 10 || tags.iter().any(|t| !db::valid_tag(t)) {
+                return Ok(err(s, 400, "tags: up to 10, each 1-24 chars of a-z 0-9 - ."));
+            }
+            if db::set_tags(c, id, &tags)? == 0 {
+                return Ok(err(s, 404, "no such host"));
+            }
+            audit(st, c, &me.username, "host.tags", id, &tags.join(","), ip);
+            json_resp(s, 200, json!({"ok": true, "tags": tags}));
+        }
         ("GET", p) if p.starts_with("/api/host/") => {
-            let id = &p["/api/host/".len()..];
+            let rest = &p["/api/host/".len()..];
+            let (id, sub) = rest.split_once('/').unwrap_or((rest, ""));
             if !valid_id(id) {
                 return Ok(err(s, 400, "bad host id"));
             }
             let Some(h) = db::hosts(c)?.into_iter().find(|h| h.id == id) else { return Ok(err(s, 404, "no such host")) };
-            let ls = db::listeners(c, id)?;
-            let cs = db::conns(c, id)?;
-            let ev = db::events(c, id, 300)?;
-            let hist = db::established_history(c, id, 120)?;
-            json_resp(s, 200, json!({
-                "host": host_json(&h),
-                "listeners": ls.iter().map(|l| json!({"proto": l.proto, "addr": l.addr, "port": l.port, "pid": l.pid, "process": l.process, "user": l.user, "first_seen": l.first_seen})).collect::<Vec<_>>(),
-                "conns": cs.iter().take(2000).map(|x| json!({"proto": x.proto, "state": x.state, "local": x.local, "remote": x.remote, "pid": x.pid, "process": x.process})).collect::<Vec<_>>(),
-                "conns_total": cs.len(),
-                "events": ev.iter().map(|e| json!({"ts": e.ts, "event": e.event, "what": e.what})).collect::<Vec<_>>(),
-                "history": hist,
-            }));
+            match sub {
+                "" => {
+                    let ls = db::listeners(c, id)?;
+                    let cs = db::conns(c, id)?;
+                    let ev = db::events(c, id, 300)?;
+                    let hist = db::established_history(c, id, 120)?;
+                    json_resp(s, 200, json!({
+                        "host": host_json(&h),
+                        "listeners": ls.iter().map(|l| json!({"proto": l.proto, "addr": l.addr, "port": l.port, "pid": l.pid, "process": l.process, "user": l.user, "first_seen": l.first_seen})).collect::<Vec<_>>(),
+                        "conns": cs.iter().take(2000).map(|x| json!({"proto": x.proto, "state": x.state, "local": x.local, "remote": x.remote, "pid": x.pid, "process": x.process})).collect::<Vec<_>>(),
+                        "conns_total": cs.len(),
+                        "events": ev.iter().map(|e| json!({"ts": e.ts, "event": e.event, "what": e.what})).collect::<Vec<_>>(),
+                        "history": hist,
+                    }));
+                }
+                "metrics" => {
+                    let secs: u64 = match req.query.get("range").map(String::as_str) {
+                        Some("1h") => 3600,
+                        Some("24h") => 86400,
+                        Some("7d") => 7 * 86400,
+                        _ => 6 * 3600,
+                    };
+                    let bucket = (secs / 150).max(10);
+                    let since = now_secs().saturating_sub(secs);
+                    let rows = db::metric_series(c, id, since, bucket)?;
+                    json_resp(s, 200, json!({
+                        "since": since, "until": now_secs(), "bucket": bucket,
+                        "t": rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                        "established": rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                        "syn_recv": rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                        "time_wait": rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                        "listeners": rows.iter().map(|r| r.4).collect::<Vec<_>>(),
+                    }));
+                }
+                "timeline" => {
+                    let rows = db::timeline(c, id, 400)?;
+                    json_resp(s, 200, json!({"events": rows.iter().map(|r| json!({"ts": r.ts, "type": r.kind, "severity": r.severity, "title": r.title, "detail": r.detail})).collect::<Vec<_>>()}));
+                }
+                _ => return Ok(err(s, 404, "not found")),
+            }
+        }
+        ("GET", "/api/mutes") => {
+            let list = db::mutes(c)?;
+            json_resp(s, 200, json!({"mutes": list.iter().map(|m| json!({"id": m.id, "host_id": m.host_id, "host": m.host, "kind": m.kind, "until": m.until, "reason": m.reason, "created_by": m.created_by, "created": m.created, "active": m.active})).collect::<Vec<_>>()}));
+        }
+        ("POST", "/api/mutes/add") => {
+            if rank < role_rank("operator") {
+                return Ok(forbidden(s));
+            }
+            let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let host = v["host"].as_str().filter(|h| !h.is_empty());
+            let kind = v["kind"].as_str().filter(|k| !k.is_empty());
+            let minutes = v["minutes"].as_u64().unwrap_or(0);
+            let reason = v["reason"].as_str().map(str::trim).unwrap_or("");
+            if host.map_or(false, |h| !valid_id(h)) || kind.map_or(false, |k| !valid_kind(k)) {
+                return Ok(err(s, 400, "bad host or alert type"));
+            }
+            if !(5..=7 * 24 * 60).contains(&minutes) {
+                return Ok(err(s, 400, "duration must be between 5 minutes and 7 days"));
+            }
+            if reason.chars().count() < 3 {
+                return Ok(err(s, 400, "a reason is required (it is recorded in the audit log)"));
+            }
+            db::add_mute(c, host, kind, minutes, reason, &me.username)?;
+            audit(st, c, &me.username, "mute.add", host.unwrap_or("all hosts"), &format!("kind={} for {minutes}m: {}", kind.unwrap_or("any"), reason), ip);
+            json_resp(s, 200, json!({"ok": true}));
+        }
+        ("POST", "/api/mutes/end") => {
+            if rank < role_rank("operator") {
+                return Ok(forbidden(s));
+            }
+            let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let Some(id) = v["id"].as_i64() else { return Ok(err(s, 400, "missing mute id")) };
+            if db::end_mute(c, id)? == 0 {
+                return Ok(err(s, 404, "no such active mute"));
+            }
+            audit(st, c, &me.username, "mute.end", &id.to_string(), "", ip);
+            json_resp(s, 200, json!({"ok": true}));
         }
         ("POST", "/api/ack") => {
             if rank < role_rank("operator") {
@@ -660,5 +931,27 @@ pub fn cmd(args: &[String]) {
             }
             st.active.fetch_sub(1, Ordering::Relaxed);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_decode_is_total() {
+        assert_eq!(url_decode("a%20b+c%2Fd"), "a b c/d");
+        assert_eq!(url_decode("%zz%4"), "%zz%4");
+        assert_eq!(url_decode("%é"), "%é");
+        assert_eq!(url_decode("%C3%A9"), "é");
+        assert_eq!(url_decode("%"), "%");
+        assert_eq!(url_decode("%FF%FE"), "\u{fffd}\u{fffd}");
+    }
+
+    #[test]
+    fn csv_and_labels() {
+        assert_eq!(csv_cell("=1+1"), "\"'=1+1\"");
+        assert_eq!(csv_cell("a\"b"), "\"a\"\"b\"");
+        assert_eq!(prom_label("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
     }
 }

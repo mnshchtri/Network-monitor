@@ -43,6 +43,9 @@ netwatch server - central collector
                           Manage dashboard accounts and roles (see 'netwatch server user')
     netwatch server audit [--limit N] [--json] [--verify]
                           Show the audit log, or verify its integrity chain
+    netwatch server metrics-token [--dir D] [--disable]
+                          Enable the Prometheus endpoint (GET /metrics on the web dashboard port) and
+                          print its bearer token once. Running it again rotates the token.
     netwatch server set-password [--dir D]
                           Set the 'admin' account password (bootstrap)
     netwatch server webhook test [--dir D]
@@ -72,6 +75,7 @@ pub fn cmd(args: &[String]) {
         Some("config") => config(rest),
         Some("webhook") => webhook_cmd(rest),
         Some("set-password") => set_password(rest),
+        Some("metrics-token") => metrics_token(rest),
         Some("user") => super::users::user_cmd(rest),
         Some("audit") => super::users::audit_cmd(rest),
         _ => print!("{HELP}"),
@@ -218,6 +222,22 @@ pub fn read_secret(prompt: &str, tty: bool) -> String {
         eprintln!();
     }
     line.trim_end_matches(['\n', '\r']).to_string()
+}
+
+fn metrics_token(args: &[String]) {
+    let c = open_db(&dir_of(args));
+    let actor = super::users::cli_actor();
+    if has(args, "--disable") {
+        db::set_setting(&c, "metrics_token_hash", "").unwrap_or_else(|e| fail(&format!("{e}")));
+        let _ = db::audit(&c, &actor, "metrics.disable", "", "", "");
+        println!("metrics endpoint disabled");
+        return;
+    }
+    let token = random_hex(24);
+    db::set_setting(&c, "metrics_token_hash", &sha256_hex(token.as_bytes())).unwrap_or_else(|e| fail(&format!("{e}")));
+    let _ = db::audit(&c, &actor, "metrics.token", "", "token created/rotated", "");
+    println!("Prometheus bearer token (shown once, only its hash is stored):\n\n  {token}\n");
+    println!("prometheus.yml:\n  scrape_configs:\n    - job_name: netwatch\n      scheme: https            # or http behind an SSH tunnel / on loopback\n      authorization: {{ credentials: {token} }}\n      static_configs: [{{ targets: ['127.0.0.1:8080'] }}]\n      # if the dashboard is served on a public name, also pass --allow-host for it");
 }
 
 /// Legacy/bootstrap command: set (or create) the `admin` account's password.
@@ -369,12 +389,16 @@ fn handle(sh: &Shared, stream: TcpStream, peer: &str) -> std::io::Result<()> {
                 Ok((changes, recovered)) => {
                     log_alerts(sh, name, &r);
                     for a in &r.alerts {
+                        // Muted (maintenance) alerts are still stored and shown, just not pushed out.
+                        if db::is_muted(&dbc, id, &clean(&a.kind, 32)).unwrap_or(false) {
+                            continue;
+                        }
                         let _ = sh.notify.try_send(Notification {
                             host: name.clone(), ts: a.ts, kind: clean(&a.kind, 32), severity: clean(&a.severity, 8),
                             source: a.source.as_deref().map(|s| clean(s, 64)), message: clean(&a.message, 500),
                         });
                     }
-                    if recovered {
+                    if recovered && !db::is_muted(&dbc, id, "HOST_UP").unwrap_or(false) {
                         let _ = sh.notify.try_send(Notification {
                             host: name.clone(), ts: now_secs(), kind: "HOST_UP".into(), severity: "INFO".into(),
                             source: None, message: "agent is reporting again".into(),
