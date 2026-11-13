@@ -7,6 +7,7 @@ pub mod pki;
 pub mod proto;
 pub mod server;
 pub mod tui;
+pub mod up;
 pub mod util;
 pub mod web;
 pub mod webhook;

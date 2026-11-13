@@ -24,6 +24,7 @@ COMMANDS:
     ports                 Listening ports with owning process (like lsof -i / ss -ltnup)
     conns                 All sockets with owning process and state
     watch                 Continuously monitor and alert on suspected attacks
+    up                    Run server + agent + web dashboard together   [fleet]
     agent                 Report to a central server (enroll / run)      [fleet]
     server                Central collector (init / token / run / hosts) [fleet]
     tui                   Console dashboard for the server's data        [fleet]
@@ -309,6 +310,8 @@ fn main() {
         Some("agent") => fleet::agent::cmd(&args[1..]),
         #[cfg(feature = "fleet")]
         Some("server") => fleet::server::cmd(&args[1..]),
+        #[cfg(feature = "fleet")]
+        Some("up") => fleet::up::cmd(&args[1..]),
         #[cfg(feature = "fleet")]
         Some("web") => fleet::web::cmd(&args[1..]),
         #[cfg(feature = "fleet")]

@@ -34,8 +34,12 @@ struct AgentFile {
     host_id: String,
 }
 
+pub fn default_agent_dir() -> PathBuf {
+    default_dir("/etc/netwatch", ".config/netwatch")
+}
+
 fn dir_of(args: &[String]) -> PathBuf {
-    opt(args, "--dir").map(PathBuf::from).unwrap_or_else(|| default_dir("/etc/netwatch", ".config/netwatch"))
+    opt(args, "--dir").map(PathBuf::from).unwrap_or_else(default_agent_dir)
 }
 
 pub fn cmd(args: &[String]) {

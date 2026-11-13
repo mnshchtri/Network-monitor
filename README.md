@@ -35,6 +35,14 @@ sudo netwatch watch                       # live attack detection
 sudo netwatch watch --log alerts.jsonl --ignore 203.0.113.7
 ```
 
+## Quick start: everything on one machine
+
+```sh
+netwatch up
+```
+
+First run creates the server CA, enrolls this machine as a monitored host and asks you to choose the web dashboard password. After that it starts the server, the agent and the dashboard (`http://127.0.0.1:8080`) together, prefixes each component's log lines, restarts anything that crashes and stops them all on Ctrl-C. Options: `--port`, `--web-listen`, `--no-agent`, `--no-web`, `--dir`, `--agent-dir`. Use `sudo netwatch up` to see process names for every socket. For always-on use, install the systemd services below instead.
+
 ## Usage: fleet mode (agent / server / dashboard)
 
 Monitor many servers from one place, the way Zabbix does.
