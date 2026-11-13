@@ -196,3 +196,19 @@ impl ServerCertVerifier for PinVerifier {
         self.provider.signature_verification_algorithms.supported_schemes()
     }
 }
+
+/// TLS config for the web dashboard (no client certificates; browsers authenticate by login).
+pub fn web_config(cert_pem: &str, key_pem: &str) -> Res<Arc<ServerConfig>> {
+    let chain: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(cert_pem.as_bytes()).collect::<Result<_, _>>()?;
+    if chain.is_empty() {
+        return Err("no certificate found in the PEM file".into());
+    }
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
+    let mut cfg = ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
+        .with_no_client_auth()
+        .with_single_cert(chain, key)?;
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(cfg))
+}

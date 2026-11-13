@@ -1,7 +1,7 @@
 //! SQLite storage shared by the server (writer) and the console UI (reader/acker).
 
 use super::proto::{RemoteConfig, Report};
-use super::util::{clean, now_secs, random_hex};
+use super::util::{clean, now_secs, random_hex, sha256_hex};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::path::Path;
@@ -14,7 +14,24 @@ pub fn open(path: &Path) -> Res<Connection> {
     c.pragma_update(None, "journal_mode", "WAL")?;
     c.pragma_update(None, "synchronous", "NORMAL")?;
     c.execute_batch(SCHEMA)?;
+    migrate_users(&c)?;
     Ok(c)
+}
+
+/// Older versions had a single shared dashboard password. Turn it into the first admin account
+/// and force a password change at first login.
+fn migrate_users(c: &Connection) -> Res<()> {
+    if count_users(c)? == 0 {
+        if let Some(h) = get_setting(c, "web_password")?.filter(|h| !h.is_empty()) {
+            c.execute(
+                "INSERT INTO users(username, pw_hash, role, must_change, created) VALUES('admin', ?1, 'admin', 1, ?2)",
+                params![h, now_secs() as i64],
+            )?;
+            c.execute("DELETE FROM settings WHERE key = 'web_password'", [])?;
+            audit(c, "system", "user.migrate", "admin", "converted the legacy shared dashboard password into the admin account", "")?;
+        }
+    }
+    Ok(())
 }
 
 const SCHEMA: &str = "
@@ -47,6 +64,14 @@ CREATE TABLE IF NOT EXISTS metrics(
   time_wait INTEGER, listeners INTEGER, total INTEGER);
 CREATE INDEX IF NOT EXISTS metrics_host ON metrics(host_id, ts DESC);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS users(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL COLLATE NOCASE, pw_hash TEXT NOT NULL,
+  role TEXT NOT NULL, disabled INTEGER NOT NULL DEFAULT 0, must_change INTEGER NOT NULL DEFAULT 0,
+  totp_secret TEXT, totp_last INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL, last_login INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS audit(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
+  target TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '',
+  prev TEXT NOT NULL, hash TEXT NOT NULL);
 ";
 
 // ---------- enrollment ----------
@@ -394,4 +419,168 @@ pub fn established_history(c: &Connection, host: &str, points: usize) -> Res<Vec
     let mut v: Vec<u64> = st.query_map(params![host, points as i64], |r| Ok(r.get::<_, i64>(0)?.max(0) as u64))?.collect::<Res<_>>()?;
     v.reverse();
     Ok(v)
+}
+
+
+// ---------- users ----------
+
+#[derive(Clone, Debug)]
+pub struct User {
+    pub id: i64,
+    pub username: String,
+    pub pw_hash: String,
+    pub role: String,
+    pub disabled: bool,
+    pub must_change: bool,
+    pub totp_secret: Option<String>,
+    pub totp_last: i64,
+    pub created: u64,
+    pub last_login: u64,
+}
+
+const USER_COLS: &str = "id, username, pw_hash, role, disabled, must_change, totp_secret, totp_last, created, last_login";
+
+fn user_row(r: &rusqlite::Row) -> Res<User> {
+    Ok(User {
+        id: r.get(0)?, username: r.get(1)?, pw_hash: r.get(2)?, role: r.get(3)?, disabled: r.get::<_, i64>(4)? != 0,
+        must_change: r.get::<_, i64>(5)? != 0, totp_secret: r.get(6)?, totp_last: r.get(7)?,
+        created: r.get::<_, i64>(8)? as u64, last_login: r.get::<_, i64>(9)? as u64,
+    })
+}
+
+pub fn count_users(c: &Connection) -> Res<i64> {
+    c.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+}
+
+pub fn user_by_name(c: &Connection, name: &str) -> Res<Option<User>> {
+    c.query_row(&format!("SELECT {USER_COLS} FROM users WHERE username = ?1"), [name], user_row).optional()
+}
+
+pub fn user_by_id(c: &Connection, id: i64) -> Res<Option<User>> {
+    c.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1"), [id], user_row).optional()
+}
+
+pub fn users(c: &Connection) -> Res<Vec<User>> {
+    let mut st = c.prepare(&format!("SELECT {USER_COLS} FROM users ORDER BY username"))?;
+    let rows = st.query_map([], user_row)?;
+    rows.collect()
+}
+
+pub fn add_user(c: &Connection, name: &str, hash: &str, role: &str, must_change: bool) -> Res<()> {
+    c.execute(
+        "INSERT INTO users(username, pw_hash, role, must_change, created) VALUES(?1,?2,?3,?4,?5)",
+        params![name, hash, role, must_change as i64, now_secs() as i64],
+    )?;
+    Ok(())
+}
+
+pub fn set_password(c: &Connection, id: i64, hash: &str, must_change: bool) -> Res<()> {
+    c.execute("UPDATE users SET pw_hash = ?2, must_change = ?3 WHERE id = ?1", params![id, hash, must_change as i64])?;
+    Ok(())
+}
+
+pub fn set_role(c: &Connection, id: i64, role: &str) -> Res<()> {
+    c.execute("UPDATE users SET role = ?2 WHERE id = ?1", params![id, role])?;
+    Ok(())
+}
+
+pub fn set_disabled(c: &Connection, id: i64, d: bool) -> Res<()> {
+    c.execute("UPDATE users SET disabled = ?2 WHERE id = ?1", params![id, d as i64])?;
+    Ok(())
+}
+
+pub fn set_totp(c: &Connection, id: i64, secret: Option<&str>) -> Res<()> {
+    c.execute("UPDATE users SET totp_secret = ?2, totp_last = 0 WHERE id = ?1", params![id, secret])?;
+    Ok(())
+}
+
+pub fn set_totp_last(c: &Connection, id: i64, step: i64) -> Res<()> {
+    c.execute("UPDATE users SET totp_last = ?2 WHERE id = ?1", params![id, step])?;
+    Ok(())
+}
+
+pub fn touch_login(c: &Connection, id: i64) -> Res<()> {
+    c.execute("UPDATE users SET last_login = ?2 WHERE id = ?1", params![id, now_secs() as i64])?;
+    Ok(())
+}
+
+pub fn delete_user(c: &Connection, id: i64) -> Res<()> {
+    c.execute("DELETE FROM users WHERE id = ?1", [id])?;
+    Ok(())
+}
+
+pub fn enabled_admins(c: &Connection) -> Res<i64> {
+    c.query_row("SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled = 0", [], |r| r.get(0))
+}
+
+// ---------- audit log (hash chained) ----------
+
+fn audit_hash(prev: &str, ts: i64, actor: &str, action: &str, target: &str, detail: &str, ip: &str) -> String {
+    sha256_hex(serde_json::json!([prev, ts, actor, action, target, detail, ip]).to_string().as_bytes())
+}
+
+/// Append an entry. Each entry commits to the previous one's hash, so editing or deleting a row in
+/// the middle of the log is detectable with `netwatch audit --verify`.
+pub fn audit(c: &Connection, actor: &str, action: &str, target: &str, detail: &str, ip: &str) -> Res<()> {
+    let tx = rusqlite::Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
+    let prev: String = tx
+        .query_row("SELECT hash FROM audit ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+        .optional()?
+        .unwrap_or_else(|| "0".repeat(64));
+    let (actor, action, target, detail, ip) = (clean(actor, 64), clean(action, 48), clean(target, 96), clean(detail, 400), clean(ip, 64));
+    let ts = now_secs() as i64;
+    let h = audit_hash(&prev, ts, &actor, &action, &target, &detail, &ip);
+    tx.execute(
+        "INSERT INTO audit(ts, actor, action, target, detail, ip, prev, hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![ts, actor, action, target, detail, ip, prev, h],
+    )?;
+    tx.commit()
+}
+
+#[derive(Clone, Debug)]
+pub struct AuditRow {
+    pub id: i64,
+    pub ts: u64,
+    pub actor: String,
+    pub action: String,
+    pub target: String,
+    pub detail: String,
+    pub ip: String,
+}
+
+pub fn audit_rows(c: &Connection, limit: usize) -> Res<Vec<AuditRow>> {
+    let mut st = c.prepare("SELECT id, ts, actor, action, target, detail, ip FROM audit ORDER BY id DESC LIMIT ?1")?;
+    let rows = st.query_map([limit as i64], |r| {
+        Ok(AuditRow { id: r.get(0)?, ts: r.get::<_, i64>(1)? as u64, actor: r.get(2)?, action: r.get(3)?, target: r.get(4)?, detail: r.get(5)?, ip: r.get(6)? })
+    })?;
+    rows.collect()
+}
+
+pub fn audit_head(c: &Connection) -> Res<Option<(i64, String)>> {
+    c.query_row("SELECT id, hash FROM audit ORDER BY id DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()
+}
+
+/// Recompute the whole chain. Ok(n entries) or Err(description of the first inconsistency).
+pub fn audit_verify(c: &Connection) -> Result<usize, String> {
+    let mut st = c
+        .prepare("SELECT id, ts, actor, action, target, detail, ip, prev, hash FROM audit ORDER BY id")
+        .map_err(|e| e.to_string())?;
+    let mut rows = st.query([]).map_err(|e| e.to_string())?;
+    let mut prev = "0".repeat(64);
+    let mut n = 0;
+    while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+        let g = |i| r.get::<_, String>(i).map_err(|e| e.to_string());
+        let id: i64 = r.get(0).map_err(|e| e.to_string())?;
+        let ts: i64 = r.get(1).map_err(|e| e.to_string())?;
+        let (stored_prev, hash) = (g(7)?, g(8)?);
+        if stored_prev != prev {
+            return Err(format!("entry {id}: chain broken (a previous entry was removed or altered)"));
+        }
+        if audit_hash(&stored_prev, ts, &g(2)?, &g(3)?, &g(4)?, &g(5)?, &g(6)?) != hash {
+            return Err(format!("entry {id}: contents do not match their hash (entry was modified)"));
+        }
+        prev = hash;
+        n += 1;
+    }
+    Ok(n)
 }

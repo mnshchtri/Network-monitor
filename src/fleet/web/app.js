@@ -1,7 +1,8 @@
 "use strict";
 // All dynamic content goes through textContent (never innerHTML), so agent-supplied data cannot inject markup.
 const $app = document.getElementById("app");
-const S = { hosts: [], openAlerts: 0, sel: null, tab: "alerts", showAcked: false, filter: "", data: null, alerts: [], online: true, timer: null };
+const S = { me: null, view: "hosts", hosts: [], openAlerts: 0, sel: null, tab: "alerts", showAcked: false, filter: "", data: null, alerts: [], online: true, timer: null, sessions: [], audit: null };
+const canAck = () => S.me && (S.me.role === "operator" || S.me.role === "admin");
 const TABS = [["alerts", "Alerts"], ["ports", "Listening ports"], ["conns", "Connections"], ["changes", "Changes"]];
 
 function h(tag, attrs, ...kids) {
@@ -25,39 +26,73 @@ async function api(path, body) {
   const r = await fetch(path, opt);
   if (r.status === 401 && path !== "/api/login") { showLogin(); throw new Error("login"); }
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || r.statusText);
+  if (r.status === 403 && j.must_change) { S.me = { ...(S.me || {}), must_change: true }; showChangePassword(); throw new Error("login"); }
+  if (!r.ok) { const e = new Error(j.error || r.statusText); e.data = j; throw e; }
   return j;
 }
 const ago = ts => { const d = Math.max(0, Math.floor(Date.now() / 1000 - ts)); return d < 60 ? d + "s ago" : d < 3600 ? Math.floor(d / 60) + "m ago" : d < 86400 ? Math.floor(d / 3600) + "h ago" : Math.floor(d / 86400) + "d ago"; };
 const when = ts => new Date(ts * 1000).toLocaleString();
 
 /* ---------- login ---------- */
-function showLogin() {
-  clearInterval(S.timer);
-  const err = h("div", { class: "err" });
-  const pw = h("input", { type: "password", placeholder: "Password", autocomplete: "current-password", required: true });
-  const form = h("form", {}, h("h1", {}, "net", h("span", {}, "watch")), pw, h("button", { class: "primary", type: "submit" }, "Sign in"), err);
+function showLogin(msg) {
+  clearInterval(S.timer); S.me = null;
+  const err = h("div", { class: "err" }, msg || "");
+  const user = h("input", { type: "text", name: "username", autocomplete: "username", required: true, autocapitalize: "none", spellcheck: "false" });
+  const pw = h("input", { type: "password", name: "password", autocomplete: "current-password", required: true });
+  const code = h("input", { type: "text", name: "code", inputmode: "numeric", autocomplete: "one-time-code", maxlength: "6", pattern: "[0-9]{6}" });
+  const codeRow = h("label", { hidden: true }, "Two-factor code", code);
+  const form = h("form", {}, h("h1", {}, "net", h("span", {}, "watch")),
+    h("label", {}, "Username", user), h("label", {}, "Password", pw), codeRow,
+    h("button", { class: "primary", type: "submit" }, "Sign in"), err);
   form.addEventListener("submit", async e => {
-    e.preventDefault();
-    try { await api("/api/login", { password: pw.value }); start(); }
-    catch (x) { err.textContent = x.message; pw.select(); }
+    e.preventDefault(); err.textContent = "";
+    try { await api("/api/login", { username: user.value, password: pw.value, code: code.value }); start(); }
+    catch (x) {
+      err.textContent = x.message;
+      if (x.data && x.data.need_code) { codeRow.hidden = false; code.value = ""; code.focus(); } else { pw.select(); }
+    }
   });
   $app.replaceChildren(h("div", { class: "login" }, form));
-  pw.focus();
+  user.focus();
+}
+
+function showChangePassword() {
+  clearInterval(S.timer);
+  const err = h("div", { class: "err" });
+  const f = n => h("input", { type: "password", autocomplete: n, required: true });
+  const old = f("current-password"), n1 = f("new-password"), n2 = f("new-password");
+  const form = h("form", { class: "gate" }, h("h2", {}, "Change your password"),
+    h("div", { class: "note" }, "You must set a new password before continuing (at least 12 characters, not containing your username)."),
+    h("label", {}, "Current password", old), h("label", {}, "New password", n1), h("label", {}, "Repeat new password", n2),
+    h("button", { class: "primary", type: "submit" }, "Change password"), err);
+  form.addEventListener("submit", async e => {
+    e.preventDefault(); err.textContent = "";
+    if (n1.value !== n2.value) { err.textContent = "the new passwords do not match"; return; }
+    try { await api("/api/password", { old: old.value, new: n1.value }); start(); }
+    catch (x) { if (x.message !== "login") err.textContent = x.message; }
+  });
+  $app.replaceChildren(h("div", { class: "login" }, form));
+  old.focus();
 }
 
 /* ---------- data ---------- */
 async function refresh() {
   try {
+    if (!S.me || S.me.must_change === undefined) S.me = await api("/api/me");
+    if (S.me.must_change) return showChangePassword();
     const sum = await api("/api/summary");
     S.hosts = sum.hosts; S.openAlerts = sum.open_alerts; S.online = true;
-    if (S.sel && !S.hosts.some(x => x.id === S.sel)) S.sel = null;
-    if (!S.sel) {
-      S.data = null;
-      S.alerts = (await api("/api/alerts?limit=500" + (S.showAcked ? "&all=1" : ""))).alerts;
-    } else {
-      S.data = await api("/api/host/" + S.sel);
-      if (S.tab === "alerts") S.alerts = (await api("/api/alerts?host=" + S.sel + "&limit=500" + (S.showAcked ? "&all=1" : ""))).alerts;
+    if (S.view === "sessions") S.sessions = (await api("/api/sessions")).sessions;
+    else if (S.view === "audit") S.audit = await api("/api/audit?limit=500");
+    else {
+      if (S.sel && !S.hosts.some(x => x.id === S.sel)) S.sel = null;
+      if (!S.sel) {
+        S.data = null;
+        S.alerts = (await api("/api/alerts?limit=500" + (S.showAcked ? "&all=1" : ""))).alerts;
+      } else {
+        S.data = await api("/api/host/" + S.sel);
+        if (S.tab === "alerts") S.alerts = (await api("/api/alerts?host=" + S.sel + "&limit=500" + (S.showAcked ? "&all=1" : ""))).alerts;
+      }
     }
   } catch (e) { if (e.message === "login") return; S.online = false; }
   render();
@@ -81,27 +116,57 @@ function render() {
     h("div", { class: "stat" + (S.openAlerts ? " warn" : "") }, h("b", {}, S.openAlerts), "open alerts"),
     h("div", { class: "grow" }),
     h("div", { class: "conn" + (S.online ? "" : " dead") }, S.online ? "● live" : "● server unreachable"),
-    h("button", { onclick: async () => { await api("/api/logout", {}).catch(() => {}); showLogin(); } }, "Sign out"));
+    h("div", { class: "userbox" }, h("span", {}, S.me.username), h("span", { class: "role " + S.me.role }, S.me.role),
+      h("button", { onclick: async () => { await api("/api/logout", {}).catch(() => {}); showLogin(); } }, "Sign out")));
 
   const side = document.getElementById("side");
-  const item = (id, dot, name, sub, badge) => h("div", { class: "host" + (S.sel === id ? " sel" : ""), onclick: () => { S.sel = id; S.tab = "alerts"; S.filter = ""; S.data = null; refresh(); } },
+  const go = (view, sel) => { S.view = view; S.sel = sel ?? null; S.tab = "alerts"; S.filter = ""; S.data = null; refresh(); };
+  const item = (id, dot, name, sub, badge) => h("div", { class: "host" + (S.view === "hosts" && S.sel === id ? " sel" : ""), onclick: () => go("hosts", id) },
     dot, h("div", { class: "n" }, h("div", {}, name), sub && h("div", { class: "sub" }, sub)), badge ? h("span", { class: "badge" }, badge) : null);
+  const nav = (view, label) => h("div", { class: "navitem" + (S.view === view ? " sel" : ""), onclick: () => go(view) }, label);
   side.replaceChildren(item(null, h("span", {}, "★"), "All hosts", null, S.openAlerts),
-    ...S.hosts.map(x => item(x.id, h("span", { class: "dot " + x.status }), x.name, x.status === "up" ? x.addr : x.status + " · " + ago(x.last_seen), x.open_alerts)));
+    ...S.hosts.map(x => item(x.id, h("span", { class: "dot " + x.status }), x.name, x.status === "up" ? x.addr : x.status + " · " + ago(x.last_seen), x.open_alerts)),
+    h("div", { class: "side-nav" }, nav("sessions", "Sessions"), S.me.role === "admin" && nav("audit", "Audit log")));
 
   const c = document.getElementById("content"), keep = c.scrollTop;
-  const kids = !S.hosts.length
-    ? [h("div", { class: "empty" }, "No agents enrolled yet. Run ", h("code", {}, "netwatch server token"), " on the server and follow the printed command on a host to monitor.")]
-    : S.sel && S.data ? hostView() : [h("div", { class: "title" }, h("h2", {}, "Alert feed · all hosts")), alertsBar(), alertsTable(true)];
+  let kids;
+  if (S.view === "sessions") kids = sessionsView();
+  else if (S.view === "audit" && S.me.role === "admin") kids = auditView();
+  else if (!S.hosts.length) kids = [h("div", { class: "empty" }, "No agents enrolled yet. Run ", h("code", {}, "netwatch server token"), " on the server and follow the printed command on a host to monitor.")];
+  else kids = S.sel && S.data ? hostView() : [h("div", { class: "title" }, h("h2", {}, "Alert feed · all hosts")), alertsBar(), alertsTable(true)];
   c.replaceChildren(...kids);
   c.scrollTop = keep;
+}
+
+function sessionsView() {
+  const admin = S.me.role === "admin";
+  return [h("div", { class: "title" }, h("h2", {}, admin ? "Active sessions · all users" : "Your sessions")),
+    h("div", { class: "bar" }, h("div", { class: "grow" }),
+      h("button", { class: "danger", onclick: async () => { if (!confirm("Sign out of every session of your account, including this one?")) return; await api("/api/logout-all", {}).catch(() => {}); showLogin(); } }, "Sign out everywhere")),
+    S.sessions.length ? h("table", {}, h("thead", {}, h("tr", {}, ["User", "From", "Signed in", "Last active", ""].map(t => h("th", {}, t)))),
+      h("tbody", {}, S.sessions.map(x => h("tr", {}, h("td", {}, x.user, x.current && h("span", { class: "cur" }, "  (this session)")), h("td", { class: "mono" }, x.ip), h("td", { title: when(x.created) }, ago(x.created)), h("td", {}, ago(x.last)),
+        h("td", {}, x.current ? "" : h("button", { class: "danger", onclick: async () => { await api("/api/sessions/revoke", { id: x.id }); refresh(); } }, "Revoke")))))) : h("div", { class: "empty" }, "No sessions."),
+    h("div", { class: "note" }, "Sessions end after inactivity or at the absolute lifetime. Changing your password ends your other sessions.")];
+}
+
+function auditView() {
+  const d = S.audit; if (!d) return [h("div", { class: "empty" }, "Loading…")];
+  const q = S.filter.toLowerCase();
+  const rows = d.entries.filter(e => !q || [e.actor, e.action, e.target, e.detail, e.ip].some(v => String(v).toLowerCase().includes(q)));
+  const search = h("input", { type: "search", id: "filter", placeholder: "Filter…", value: S.filter, oninput: e => { S.filter = e.target.value; const p = e.target.selectionStart; render(); const n = document.getElementById("filter"); n.focus(); n.setSelectionRange(p, p); } });
+  return [h("div", { class: "title" }, h("h2", {}, "Audit log")),
+    h("div", { class: "integrity " + (d.integrity.ok ? "ok" : "bad") }, d.integrity.ok ? `✔ Integrity verified: ${d.integrity.entries} entries, hash chain intact` : "✖ INTEGRITY FAILURE: " + d.integrity.error),
+    h("div", { class: "bar" }, search, h("div", { class: "grow" }), h("a", { class: "btn", href: "/api/audit?format=csv&limit=20000", download: "netwatch-audit.csv" }, "Export CSV"), h("a", { class: "btn", href: "/api/audit?format=json&limit=20000", download: "netwatch-audit.json" }, "Export JSON")),
+    rows.length ? h("table", {}, h("thead", {}, h("tr", {}, ["Time", "Actor", "Action", "Target", "Detail", "From"].map(t => h("th", {}, t)))),
+      h("tbody", {}, rows.map(e => h("tr", {}, h("td", { title: String(e.ts) }, when(e.ts)), h("td", {}, e.actor), h("td", { class: "mono" }, e.action), h("td", {}, e.target), h("td", {}, e.detail), h("td", { class: "mono" }, e.ip))))) : h("div", { class: "empty" }, "No matching entries."),
+    h("div", { class: "note" }, "Each entry commits to the hash of the one before it. Verify from the server with `netwatch server audit --verify`.")];
 }
 
 function alertsBar() {
   return h("div", { class: "bar" },
     h("label", {}, h("input", { type: "checkbox", checked: S.showAcked, onchange: e => { S.showAcked = e.target.checked; refresh(); } }), "show acknowledged"),
     h("div", { class: "grow" }),
-    h("button", { onclick: async () => { await api("/api/ack", { all: true, host: S.sel }); refresh(); } }, "Acknowledge all"));
+    canAck() && h("button", { onclick: async () => { await api("/api/ack", { all: true, host: S.sel }); refresh(); } }, "Acknowledge all"));
 }
 function alertsTable(withHost) {
   if (!S.alerts.length) return h("div", { class: "empty" }, "No alerts. ✔");
@@ -109,7 +174,7 @@ function alertsTable(withHost) {
     h("tbody", {}, S.alerts.map(a => h("tr", { class: a.acked ? "acked" : "" },
       h("td", { title: when(a.ts) }, ago(a.ts)), withHost && h("td", {}, a.host), h("td", {}, h("span", { class: "sev " + a.severity }, a.severity)),
       h("td", { class: "mono" }, a.kind), h("td", {}, a.message),
-      h("td", {}, a.acked ? "" : h("button", { onclick: async () => { await api("/api/ack", { id: a.id }); refresh(); } }, "Ack"))))));
+      h("td", {}, a.acked || !canAck() ? "" : h("button", { onclick: async () => { await api("/api/ack", { id: a.id }); refresh(); } }, "Ack"))))));
 }
 
 function sparkline(vals) {
@@ -156,8 +221,8 @@ function hostView() {
 
 /* ---------- boot ---------- */
 function start() {
-  clearInterval(S.timer);
+  clearInterval(S.timer); S.me = null; S.view = "hosts";
   refresh();
   S.timer = setInterval(() => { if (!document.hidden && document.activeElement?.id !== "filter") refresh(); }, 3000);
 }
-api("/api/me").then(start).catch(() => { if (!document.getElementById("shell")) showLogin(); });
+api("/api/me").then(m => { S.me = m; start(); }).catch(() => { if (!document.getElementById("shell") && !S.me) showLogin(); });

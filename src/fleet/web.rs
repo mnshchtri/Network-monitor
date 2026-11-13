@@ -1,72 +1,92 @@
-//! Web dashboard: a small hand-written HTTP/1.1 server (std only) serving a static single-page
-//! app plus a JSON API over the server's SQLite database.
+//! Web dashboard: hand-written HTTP/1.1 server (std + optional rustls) serving a static
+//! single-page app and a JSON API over the server's SQLite database.
 //!
-//! Security posture: password login (PBKDF2), HttpOnly+SameSite=Strict session cookie, login
-//! lockout, Host-header allowlist (DNS-rebinding defence), custom-header + Origin checks on every
-//! state-changing request (CSRF), strict CSP, no third-party assets. Binds to loopback by default.
+//! Security model: per-user accounts with roles (viewer < operator < admin) enforced on every
+//! request against the database; PBKDF2 passwords; optional TOTP; idle and absolute session
+//! timeouts; login lockout per IP and per user; every sensitive action recorded in a
+//! hash-chained audit log; Host allowlist (DNS rebinding), CSRF header + Origin checks, strict
+//! CSP, text-only rendering. Account administration is CLI-only by design.
 
-use super::db;
+use super::auth::{self, role_rank};
+use super::db::{self, User};
+use super::pki;
 use super::server::default_server_dir;
 use super::util::*;
-use pbkdf2::pbkdf2_hmac;
 use serde_json::{json, Value};
-use sha2::Sha256;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const ITER: u32 = 200_000;
-const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
 const MAX_HEADERS: usize = 16 * 1024;
 const MAX_BODY: usize = 4 * 1024;
 const MAX_CONNECTIONS: usize = 64;
-const LOCK_AFTER: u32 = 5;
 const LOCK_FOR: Duration = Duration::from_secs(300);
+const IP_FAILS: u32 = 5;
+const USER_FAILS: u32 = 10;
 
 const INDEX: &str = include_str!("web/index.html");
 const CSS: &str = include_str!("web/app.css");
 const JS: &str = include_str!("web/app.js");
 
-// ---------- password hashing ----------
-
-pub fn hash_password(pw: &str) -> String {
-    let salt = random_hex(16);
-    let mut out = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(pw.as_bytes(), salt.as_bytes(), ITER, &mut out);
-    format!("pbkdf2-sha256${ITER}${salt}${}", hex(&out))
-}
-
-fn verify_password(pw: &str, stored: &str) -> bool {
-    let p: Vec<&str> = stored.split('$').collect();
-    if p.len() != 4 || p[0] != "pbkdf2-sha256" {
-        return false;
-    }
-    let Ok(iters) = p[1].parse::<u32>() else { return false };
-    if iters == 0 || iters > 5_000_000 {
-        return false;
-    }
-    let mut out = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(pw.as_bytes(), p[2].as_bytes(), iters, &mut out);
-    ct_eq(hex(&out).as_bytes(), p[3].as_bytes())
-}
-
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
+static HSTS: AtomicBool = AtomicBool::new(false);
 
 // ---------- state ----------
+
+struct Session {
+    user_id: i64,
+    username: String,
+    ip: IpAddr,
+    created: Instant,
+    last: Instant,
+    created_at: u64,
+    last_at: u64,
+}
+
+#[derive(Default)]
+struct Fails {
+    ips: HashMap<IpAddr, (u32, Option<Instant>)>,
+    users: HashMap<String, (u32, Option<Instant>)>,
+}
 
 struct State {
     dir: PathBuf,
     secure_cookie: bool,
     allowed_hosts: Vec<String>,
-    sessions: Mutex<HashMap<String, Instant>>,
-    fails: Mutex<HashMap<IpAddr, (u32, Option<Instant>)>>,
+    idle: Duration,
+    absolute: Duration,
+    sessions: Mutex<HashMap<String, Session>>,
+    fails: Mutex<Fails>,
     active: AtomicUsize,
+}
+
+fn sid(token: &str) -> String {
+    sha256_hex(token.as_bytes())[..12].to_string()
+}
+
+fn locked<K: std::hash::Hash + Eq>(m: &mut HashMap<K, (u32, Option<Instant>)>, k: &K) -> bool {
+    match m.get(k) {
+        Some((_, Some(until))) if *until > Instant::now() => true,
+        Some((_, Some(_))) => {
+            m.remove(k);
+            false
+        }
+        _ => false,
+    }
+}
+
+fn bump<K: std::hash::Hash + Eq>(m: &mut HashMap<K, (u32, Option<Instant>)>, k: K, limit: u32) {
+    if m.len() > 4000 {
+        m.retain(|_, (_, u)| u.map_or(false, |u| u > Instant::now()));
+    }
+    let e = m.entry(k).or_insert((0, None));
+    e.0 += 1;
+    if e.0 >= limit {
+        e.1 = Some(Instant::now() + LOCK_FOR);
+    }
 }
 
 impl State {
@@ -74,53 +94,32 @@ impl State {
         self.allowed_hosts.iter().any(|a| a.eq_ignore_ascii_case(h))
     }
 
-    fn new_session(&self) -> String {
+    fn new_session(&self, u: &User, ip: IpAddr) -> String {
         let t = random_hex(32);
-        let mut s = self.sessions.lock().unwrap();
         let now = Instant::now();
-        s.retain(|_, exp| *exp > now);
-        s.insert(t.clone(), now + SESSION_TTL);
+        let mut s = self.sessions.lock().unwrap();
+        s.retain(|_, x| now.duration_since(x.last) < self.idle && now.duration_since(x.created) < self.absolute);
+        s.insert(t.clone(), Session { user_id: u.id, username: u.username.clone(), ip, created: now, last: now, created_at: now_secs(), last_at: now_secs() });
         t
     }
 
-    fn session_valid(&self, req: &Req) -> bool {
-        let Some(tok) = req.cookie("nw_session") else { return false };
+    /// Validate and refresh a session; returns the user id if the cookie is live.
+    fn touch(&self, token: &str) -> Option<i64> {
         let mut s = self.sessions.lock().unwrap();
         let now = Instant::now();
-        match s.get_mut(&tok) {
-            Some(exp) if *exp > now => {
-                *exp = now + SESSION_TTL;
-                true
+        let ok = s.get(token).map(|x| now.duration_since(x.last) < self.idle && now.duration_since(x.created) < self.absolute);
+        match ok {
+            Some(true) => {
+                let x = s.get_mut(token).unwrap();
+                x.last = now;
+                x.last_at = now_secs();
+                Some(x.user_id)
             }
-            Some(_) => {
-                s.remove(&tok);
-                false
+            Some(false) => {
+                s.remove(token);
+                None
             }
-            None => false,
-        }
-    }
-
-    fn locked(&self, ip: IpAddr) -> bool {
-        let mut f = self.fails.lock().unwrap();
-        match f.get(&ip) {
-            Some((_, Some(until))) if *until > Instant::now() => true,
-            Some((_, Some(_))) => {
-                f.remove(&ip);
-                false
-            }
-            _ => false,
-        }
-    }
-
-    fn record_fail(&self, ip: IpAddr) {
-        let mut f = self.fails.lock().unwrap();
-        if f.len() > 2000 {
-            f.retain(|_, (_, u)| u.map_or(false, |u| u > Instant::now()));
-        }
-        let e = f.entry(ip).or_insert((0, None));
-        e.0 += 1;
-        if e.0 >= LOCK_AFTER {
-            e.1 = Some(Instant::now() + LOCK_FOR);
+            None => None,
         }
     }
 }
@@ -144,7 +143,7 @@ impl Req {
     }
 }
 
-fn read_req(s: &mut TcpStream) -> Result<Req, &'static str> {
+fn read_req(s: &mut impl Read) -> Result<Req, &'static str> {
     let mut buf = Vec::with_capacity(2048);
     let mut chunk = [0u8; 2048];
     let end = loop {
@@ -194,7 +193,6 @@ fn read_req(s: &mut TcpStream) -> Result<Req, &'static str> {
 fn status_text(c: u16) -> &'static str {
     match c {
         200 => "OK",
-        204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -205,7 +203,7 @@ fn status_text(c: u16) -> &'static str {
     }
 }
 
-fn send(s: &mut TcpStream, code: u16, ctype: &str, cache: &str, extra: &[String], body: &[u8]) {
+fn send(s: &mut impl Write, code: u16, ctype: &str, cache: &str, extra: &[String], body: &[u8]) {
     let mut h = format!(
         "HTTP/1.1 {code} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: {cache}\r\nConnection: close\r\n\
          X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Opener-Policy: same-origin\r\n\
@@ -213,6 +211,9 @@ fn send(s: &mut TcpStream, code: u16, ctype: &str, cache: &str, extra: &[String]
         status_text(code),
         body.len()
     );
+    if HSTS.load(Ordering::Relaxed) {
+        h.push_str("Strict-Transport-Security: max-age=31536000\r\n");
+    }
     for e in extra {
         h.push_str(e);
         h.push_str("\r\n");
@@ -220,13 +221,14 @@ fn send(s: &mut TcpStream, code: u16, ctype: &str, cache: &str, extra: &[String]
     h.push_str("\r\n");
     let _ = s.write_all(h.as_bytes());
     let _ = s.write_all(body);
+    let _ = s.flush();
 }
 
-fn json_resp(s: &mut TcpStream, code: u16, v: Value) {
+fn json_resp(s: &mut impl Write, code: u16, v: Value) {
     send(s, code, "application/json; charset=utf-8", "no-store", &[], v.to_string().as_bytes());
 }
 
-fn err(s: &mut TcpStream, code: u16, msg: &str) {
+fn err(s: &mut impl Write, code: u16, msg: &str) {
     json_resp(s, code, json!({ "error": msg }));
 }
 
@@ -234,80 +236,145 @@ fn valid_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+fn csv_cell(s: &str) -> String {
+    let mut t = s.replace('"', "\"\"");
+    // Neutralise spreadsheet formula injection in exported data.
+    if matches!(t.chars().next(), Some('=' | '+' | '-' | '@' | '\t' | '\r')) {
+        t.insert(0, '\'');
+    }
+    format!("\"{t}\"")
+}
+
 // ---------- request handling ----------
 
-fn handle(st: &State, mut s: TcpStream, peer: IpAddr) {
-    let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
-    let _ = s.set_write_timeout(Some(Duration::from_secs(10)));
-    let req = match read_req(&mut s) {
+struct Authed {
+    token: String,
+    user: User,
+}
+
+fn audit(st: &State, c: &rusqlite::Connection, actor: &str, action: &str, target: &str, detail: &str, ip: IpAddr) {
+    let _ = st; // reserved for future per-server audit sinks
+    if let Err(e) = db::audit(c, actor, action, target, detail, &ip.to_string()) {
+        eprintln!("audit write failed: {e}");
+    }
+}
+
+fn handle<S: Read + Write>(st: &State, s: &mut S, peer: IpAddr) {
+    let req = match read_req(s) {
         Ok(r) => r,
-        Err(m) => return err(&mut s, 400, m),
+        Err(m) => return err(s, 400, m),
     };
-    // DNS-rebinding defence: only answer for hostnames we are meant to be reached by.
     match req.h("host") {
         Some(h) if st.host_ok(h) => {}
-        _ => return err(&mut s, 400, "unrecognised Host header (use --allow-host to permit this name)"),
+        _ => return err(s, 400, "unrecognised Host header (use --allow-host to permit this name)"),
     }
     let post = req.method == "POST";
     if req.method != "GET" && !post {
-        return err(&mut s, 405, "method not allowed");
+        return err(s, 405, "method not allowed");
     }
     if post {
-        // CSRF: browsers cannot add this header cross-origin without a CORS preflight, which we never grant.
         if req.h("x-requested-with") != Some("netwatch") {
-            return err(&mut s, 403, "missing X-Requested-With");
+            return err(s, 403, "missing X-Requested-With");
         }
         if let Some(o) = req.h("origin") {
             let host = o.split_once("://").map(|(_, h)| h).unwrap_or(o);
             if !st.host_ok(host) {
-                return err(&mut s, 403, "cross-origin request refused");
+                return err(s, 403, "cross-origin request refused");
             }
         }
     }
 
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/") => return send(&mut s, 200, "text/html; charset=utf-8", "no-cache", &[], INDEX.as_bytes()),
-        ("GET", "/app.css") => return send(&mut s, 200, "text/css; charset=utf-8", "no-cache", &[], CSS.as_bytes()),
-        ("GET", "/app.js") => return send(&mut s, 200, "text/javascript; charset=utf-8", "no-cache", &[], JS.as_bytes()),
-        ("POST", "/api/login") => return login(st, &mut s, &req, peer),
+        ("GET", "/") => return send(s, 200, "text/html; charset=utf-8", "no-cache", &[], INDEX.as_bytes()),
+        ("GET", "/app.css") => return send(s, 200, "text/css; charset=utf-8", "no-cache", &[], CSS.as_bytes()),
+        ("GET", "/app.js") => return send(s, 200, "text/javascript; charset=utf-8", "no-cache", &[], JS.as_bytes()),
         _ => {}
     }
     if !req.path.starts_with("/api/") {
-        return err(&mut s, 404, "not found");
-    }
-    if !st.session_valid(&req) {
-        return err(&mut s, 401, "login required");
+        return err(s, 404, "not found");
     }
     let conn = match db::open(&st.dir.join("netwatch.db")) {
         Ok(c) => c,
-        Err(e) => return err(&mut s, 500, &format!("database: {e}")),
+        Err(e) => return err(s, 500, &format!("database: {e}")),
     };
-    let r = route(st, &conn, &req, &mut s);
-    if let Err(e) = r {
-        err(&mut s, 500, &format!("database: {e}"));
+    if req.method == "POST" && req.path == "/api/login" {
+        return login(st, &conn, s, &req, peer);
+    }
+    // Everything else needs a live session whose user still exists and is enabled.
+    let authed = req
+        .cookie("nw_session")
+        .and_then(|t| st.touch(&t).map(|id| (t, id)))
+        .and_then(|(t, id)| db::user_by_id(&conn, id).ok().flatten().filter(|u| !u.disabled).map(|user| Authed { token: t, user }));
+    let Some(a) = authed else {
+        return err(s, 401, "login required");
+    };
+    if let Err(e) = route(st, &conn, &req, s, &a, peer) {
+        err(s, 500, &format!("database: {e}"));
     }
 }
 
-fn login(st: &State, s: &mut TcpStream, req: &Req, peer: IpAddr) {
-    if st.locked(peer) {
-        return err(s, 429, "too many failed attempts; try again in a few minutes");
+fn session_cookie(st: &State, tok: &str, max_age: u64) -> String {
+    format!("Set-Cookie: nw_session={tok}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}{}", if st.secure_cookie { "; Secure" } else { "" })
+}
+
+fn login(st: &State, c: &rusqlite::Connection, s: &mut impl Write, req: &Req, peer: IpAddr) {
+    let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+    let username = v["username"].as_str().unwrap_or("").trim().to_string();
+    let password = v["password"].as_str().unwrap_or("").to_string();
+    let code = v["code"].as_str().unwrap_or("").to_string();
+    let ukey = username.to_lowercase();
+    {
+        let mut f = st.fails.lock().unwrap();
+        if locked(&mut f.ips, &peer) || locked(&mut f.users, &ukey) {
+            drop(f);
+            audit(st, c, &username, "login.locked", "", "attempt while locked out", peer);
+            return err(s, 429, "too many failed attempts; try again in a few minutes");
+        }
     }
-    let pw = serde_json::from_slice::<Value>(&req.body).ok().and_then(|v| v["password"].as_str().map(String::from)).unwrap_or_default();
-    let stored = db::open(&st.dir.join("netwatch.db")).ok().and_then(|c| db::get_setting(&c, "web_password").ok().flatten()).unwrap_or_default();
-    if !stored.is_empty() && verify_password(&pw, &stored) {
-        st.fails.lock().unwrap().remove(&peer);
-        let tok = st.new_session();
-        let cookie = format!(
-            "Set-Cookie: nw_session={tok}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
-            SESSION_TTL.as_secs(),
-            if st.secure_cookie { "; Secure" } else { "" }
-        );
-        send(s, 200, "application/json", "no-store", &[cookie], b"{\"ok\":true}");
-    } else {
-        st.record_fail(peer);
-        std::thread::sleep(Duration::from_millis(500));
-        err(s, 401, "wrong password");
+    let user = db::user_by_name(c, &username).ok().flatten();
+    let pw_ok = match &user {
+        Some(u) if !u.disabled => auth::verify_password(&password, &u.pw_hash),
+        _ => {
+            auth::dummy_verify(&password);
+            false
+        }
+    };
+    let fail_login = |why: &str| {
+        {
+            let mut f = st.fails.lock().unwrap();
+            bump(&mut f.ips, peer, IP_FAILS);
+            bump(&mut f.users, ukey.clone(), USER_FAILS);
+        }
+        audit(st, c, &username, "login.fail", "", why, peer);
+        std::thread::sleep(Duration::from_millis(400));
+    };
+    let Some(u) = user.filter(|_| pw_ok) else {
+        fail_login("bad credentials");
+        return err(s, 401, "invalid username or password");
+    };
+    if let Some(secret) = &u.totp_secret {
+        if code.is_empty() {
+            return json_resp(s, 401, json!({"error": "two-factor code required", "need_code": true}));
+        }
+        match auth::totp_check(secret, &code, u.totp_last, now_secs()) {
+            Some(step) => {
+                let _ = db::set_totp_last(c, u.id, step);
+            }
+            None => {
+                fail_login("bad two-factor code");
+                return json_resp(s, 401, json!({"error": "invalid two-factor code", "need_code": true}));
+            }
+        }
     }
+    {
+        let mut f = st.fails.lock().unwrap();
+        f.ips.remove(&peer);
+        f.users.remove(&ukey);
+    }
+    let _ = db::touch_login(c, u.id);
+    let tok = st.new_session(&u, peer);
+    audit(st, c, &u.username, "login.ok", "", &format!("role={}", u.role), peer);
+    send(s, 200, "application/json", "no-store", &[session_cookie(st, &tok, st.absolute.as_secs())], b"{\"ok\":true}");
 }
 
 fn host_json(h: &db::HostRow) -> Value {
@@ -320,14 +387,75 @@ fn alert_json(a: &db::AlertRow) -> Value {
     json!({"id": a.id, "host": a.host, "ts": a.ts, "kind": a.kind, "severity": a.severity, "message": a.message, "acked": a.acked})
 }
 
-fn route(st: &State, c: &rusqlite::Connection, req: &Req, s: &mut TcpStream) -> rusqlite::Result<()> {
+fn route(st: &State, c: &rusqlite::Connection, req: &Req, s: &mut impl Write, a: &Authed, ip: IpAddr) -> rusqlite::Result<()> {
+    let me = &a.user;
+    let rank = role_rank(&me.role);
+    let forbidden = |s: &mut dyn Write| {
+        let mut w = s;
+        err(&mut w, 403, "your role does not permit this");
+    };
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/api/me") => json_resp(s, 200, json!({"ok": true})),
+        ("GET", "/api/me") => json_resp(s, 200, json!({"username": me.username, "role": me.role, "must_change": me.must_change, "totp": me.totp_secret.is_some()})),
         ("POST", "/api/logout") => {
-            if let Some(t) = req.cookie("nw_session") {
-                st.sessions.lock().unwrap().remove(&t);
+            st.sessions.lock().unwrap().remove(&a.token);
+            audit(st, c, &me.username, "logout", "", "", ip);
+            send(s, 200, "application/json", "no-store", &[session_cookie(st, "", 0)], b"{\"ok\":true}");
+        }
+        ("POST", "/api/password") => {
+            let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let (old, new) = (v["old"].as_str().unwrap_or(""), v["new"].as_str().unwrap_or(""));
+            if !auth::verify_password(old, &me.pw_hash) {
+                audit(st, c, &me.username, "password.fail", "", "wrong current password", ip);
+                return Ok(err(s, 400, "current password is incorrect"));
             }
-            send(s, 200, "application/json", "no-store", &["Set-Cookie: nw_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0".into()], b"{\"ok\":true}");
+            if new == old {
+                return Ok(err(s, 400, "the new password must differ from the current one"));
+            }
+            if let Err(e) = auth::password_policy(new, &me.username) {
+                return Ok(err(s, 400, &e));
+            }
+            db::set_password(c, me.id, &auth::hash_password(new), false)?;
+            // A password change ends every other session of this user.
+            st.sessions.lock().unwrap().retain(|t, x| *t == a.token || x.user_id != me.id);
+            audit(st, c, &me.username, "password.change", "", "", ip);
+            json_resp(s, 200, json!({"ok": true}));
+        }
+        _ if me.must_change => json_resp(s, 403, json!({"error": "password change required", "must_change": true})),
+        ("POST", "/api/logout-all") => {
+            let n = {
+                let mut m = st.sessions.lock().unwrap();
+                let before = m.len();
+                m.retain(|_, x| x.user_id != me.id);
+                before - m.len()
+            };
+            audit(st, c, &me.username, "logout.all", "", &format!("{n} sessions ended"), ip);
+            send(s, 200, "application/json", "no-store", &[session_cookie(st, "", 0)], b"{\"ok\":true}");
+        }
+        ("GET", "/api/sessions") => {
+            let admin = me.role == "admin";
+            let m = st.sessions.lock().unwrap();
+            let mut list: Vec<Value> = m
+                .iter()
+                .filter(|(_, x)| admin || x.user_id == me.id)
+                .map(|(t, x)| json!({"id": sid(t), "user": x.username, "ip": x.ip.to_string(), "created": x.created_at, "last": x.last_at, "current": *t == a.token}))
+                .collect();
+            list.sort_by_key(|v| std::cmp::Reverse(v["last"].as_u64().unwrap_or(0)));
+            json_resp(s, 200, json!({"sessions": list}));
+        }
+        ("POST", "/api/sessions/revoke") => {
+            let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let id = v["id"].as_str().unwrap_or("");
+            let mut m = st.sessions.lock().unwrap();
+            let found = m.iter().find(|(t, x)| sid(t) == id && (me.role == "admin" || x.user_id == me.id)).map(|(t, x)| (t.clone(), x.username.clone()));
+            match found {
+                Some((t, who)) => {
+                    m.remove(&t);
+                    drop(m);
+                    audit(st, c, &me.username, "session.revoke", &who, &format!("session {id}"), ip);
+                    json_resp(s, 200, json!({"ok": true}));
+                }
+                None => return Ok(err(s, 404, "no such session")),
+            }
         }
         ("GET", "/api/summary") => {
             let hosts = db::hosts(c)?;
@@ -364,18 +492,54 @@ fn route(st: &State, c: &rusqlite::Connection, req: &Req, s: &mut TcpStream) -> 
             }));
         }
         ("POST", "/api/ack") => {
+            if rank < role_rank("operator") {
+                return Ok(forbidden(s));
+            }
             let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
             if let Some(id) = v["id"].as_i64() {
                 db::ack(c, id)?;
+                audit(st, c, &me.username, "alert.ack", &id.to_string(), "", ip);
             } else if v["all"].as_bool() == Some(true) {
                 match v["host"].as_str() {
                     Some(h) if !valid_id(h) => return Ok(err(s, 400, "bad host id")),
-                    h => db::ack_all(c, h)?,
+                    h => {
+                        db::ack_all(c, h)?;
+                        audit(st, c, &me.username, "alert.ack_all", h.unwrap_or("all hosts"), "", ip);
+                    }
                 }
             } else {
                 return Ok(err(s, 400, "expected {\"id\":N} or {\"all\":true}"));
             }
             json_resp(s, 200, json!({"ok": true}));
+        }
+        ("GET", "/api/audit") => {
+            if rank < role_rank("admin") {
+                return Ok(forbidden(s));
+            }
+            let limit = req.query.get("limit").and_then(|v| v.parse().ok()).unwrap_or(500usize).clamp(1, 20000);
+            let rows = db::audit_rows(c, limit)?;
+            match req.query.get("format").map(String::as_str) {
+                Some("csv") => {
+                    audit(st, c, &me.username, "audit.export", "csv", &format!("{} rows", rows.len()), ip);
+                    let mut out = String::from("id,time_utc,actor,action,target,detail,ip\n");
+                    for r in &rows {
+                        out.push_str(&format!("{},{},{},{},{},{},{}\n", r.id, csv_cell(&fmt_time(r.ts)), csv_cell(&r.actor), csv_cell(&r.action), csv_cell(&r.target), csv_cell(&r.detail), csv_cell(&r.ip)));
+                    }
+                    send(s, 200, "text/csv; charset=utf-8", "no-store", &["Content-Disposition: attachment; filename=\"netwatch-audit.csv\"".into()], out.as_bytes());
+                }
+                fmt => {
+                    if fmt == Some("json") {
+                        audit(st, c, &me.username, "audit.export", "json", &format!("{} rows", rows.len()), ip);
+                    }
+                    let body = json!({"entries": rows.iter().map(|r| json!({"id": r.id, "ts": r.ts, "actor": r.actor, "action": r.action, "target": r.target, "detail": r.detail, "ip": r.ip})).collect::<Vec<_>>(),
+                                      "integrity": match db::audit_verify(c) { Ok(n) => json!({"ok": true, "entries": n}), Err(e) => json!({"ok": false, "error": e}) }});
+                    if fmt == Some("json") {
+                        send(s, 200, "application/json", "no-store", &["Content-Disposition: attachment; filename=\"netwatch-audit.json\"".into()], body.to_string().as_bytes());
+                    } else {
+                        json_resp(s, 200, body);
+                    }
+                }
+            }
         }
         _ => err(s, 404, "not found"),
     }
@@ -387,16 +551,24 @@ fn route(st: &State, c: &rusqlite::Connection, req: &Req, s: &mut TcpStream) -> 
 pub const HELP: &str = "\
 netwatch web - web dashboard (run on the server host; reads its database)
 
-    netwatch server set-password            Set the login password first (required, min 10 chars)
-    netwatch web [--listen 127.0.0.1:8080] [--dir D] [--allow-host NAME]... [--secure]
+    netwatch server user add <name> --role admin     Create the first account (or: netwatch server set-password)
+    netwatch web [--listen 127.0.0.1:8080] [--dir D] [--allow-host NAME]...
+                 [--tls | --cert FILE --key FILE] [--secure] [--idle-minutes 30] [--session-hours 8]
 
 Binds to loopback by default; reach it remotely with an SSH tunnel:
     ssh -L 8080:127.0.0.1:8080 you@server   then open http://127.0.0.1:8080
 
---listen ADDR      Address to bind. Anything other than loopback serves PLAIN HTTP: put it behind
-                   an HTTPS reverse proxy (nginx/caddy) and never expose it directly.
---allow-host NAME  Extra Host header value accepted (needed behind a proxy / on a public name).
---secure           Mark the session cookie Secure (use when served through an HTTPS proxy).
+--tls              Serve HTTPS using the server's own certificate (browsers will warn unless you
+                   trust ca.pem from the server directory). Enables HSTS and Secure cookies.
+--cert/--key       Serve HTTPS with your own certificate (e.g. from your enterprise CA / Let's Encrypt).
+--listen ADDR      Address to bind. A non-loopback address without TLS serves plain HTTP: don't.
+--allow-host NAME  Extra Host header value accepted (public name / reverse proxy).
+--secure           Mark cookies Secure when TLS is terminated by a reverse proxy in front.
+--idle-minutes N   Sign out after N idle minutes (default 30).
+--session-hours N  Absolute session lifetime (default 8).
+
+Roles: viewer (read), operator (+ acknowledge), admin (+ audit log, all sessions).
+Accounts are managed from the CLI only: netwatch server user ...
 ";
 
 pub fn cmd(args: &[String]) {
@@ -409,18 +581,25 @@ pub fn cmd(args: &[String]) {
         fail(&format!("no database in {} (run on the server host, or pass --dir)", dir.display()));
     }
     let c = db::open(&dir.join("netwatch.db")).unwrap_or_else(|e| fail(&format!("cannot open database: {e}")));
-    if db::get_setting(&c, "web_password").ok().flatten().unwrap_or_default().is_empty() {
-        fail("no dashboard password set. Run: netwatch server set-password");
+    if db::count_users(&c).unwrap_or(0) == 0 {
+        fail("no dashboard accounts exist. Create one: netwatch server user add <name> --role admin");
     }
     drop(c);
 
     let listen = opt(args, "--listen").unwrap_or_else(|| "127.0.0.1:8080".into());
-    let addr: SocketAddr = listen
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut a| a.next())
-        .unwrap_or_else(|| fail(&format!("bad --listen address '{listen}'")));
+    let addr: SocketAddr = listen.to_socket_addrs().ok().and_then(|mut a| a.next()).unwrap_or_else(|| fail(&format!("bad --listen address '{listen}'")));
     let port = addr.port();
+
+    let tls = if let (Some(cf), Some(kf)) = (opt(args, "--cert"), opt(args, "--key")) {
+        let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_else(|e| fail(&format!("cannot read {p}: {e}")));
+        Some(pki::web_config(&rd(&cf), &rd(&kf)).unwrap_or_else(|e| fail(&format!("TLS setup failed: {e}"))))
+    } else if has(args, "--tls") {
+        let rd = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap_or_else(|e| fail(&format!("cannot read {n}: {e}")));
+        Some(pki::web_config(&rd("server.pem"), &rd("server.key")).unwrap_or_else(|e| fail(&format!("TLS setup failed: {e}"))))
+    } else {
+        None
+    };
+    HSTS.store(tls.is_some(), Ordering::Relaxed);
 
     let mut allowed = vec![listen.clone(), format!("localhost:{port}"), format!("127.0.0.1:{port}"), format!("[::1]:{port}")];
     let mut i = 0;
@@ -434,18 +613,23 @@ pub fn cmd(args: &[String]) {
         }
         i += 1;
     }
+    let mins: u64 = opt(args, "--idle-minutes").and_then(|v| v.parse().ok()).unwrap_or(30).clamp(1, 1440);
+    let hours: u64 = opt(args, "--session-hours").and_then(|v| v.parse().ok()).unwrap_or(8).clamp(1, 168);
 
     let listener = TcpListener::bind(addr).unwrap_or_else(|e| fail(&format!("cannot listen on {listen}: {e}")));
-    println!("netwatch web dashboard: http://{listen}  (data: {})", dir.display());
-    if !addr.ip().is_loopback() {
-        eprintln!("WARNING: {listen} is not loopback. This serves plain HTTP; use an HTTPS reverse proxy and --secure.");
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    println!("netwatch web dashboard: {scheme}://{listen}  (data: {})", dir.display());
+    if !addr.ip().is_loopback() && tls.is_none() && !has(args, "--secure") {
+        eprintln!("WARNING: {listen} is not loopback and TLS is off: credentials would cross the network in clear text. Use --tls/--cert, or a TLS reverse proxy with --secure.");
     }
-    let st = std::sync::Arc::new(State {
+    let st = Arc::new(State {
         dir,
-        secure_cookie: has(args, "--secure"),
+        secure_cookie: tls.is_some() || has(args, "--secure"),
         allowed_hosts: allowed,
+        idle: Duration::from_secs(mins * 60),
+        absolute: Duration::from_secs(hours * 3600),
         sessions: Mutex::new(HashMap::new()),
-        fails: Mutex::new(HashMap::new()),
+        fails: Mutex::new(Fails::default()),
         active: AtomicUsize::new(0),
     });
     for stream in listener.incoming() {
@@ -454,10 +638,25 @@ pub fn cmd(args: &[String]) {
             continue;
         }
         st.active.fetch_add(1, Ordering::Relaxed);
-        let st = st.clone();
+        let (st, tls) = (st.clone(), tls.clone());
         std::thread::spawn(move || {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
             if let Ok(peer) = stream.peer_addr() {
-                handle(&st, stream, peer.ip());
+                match tls {
+                    Some(cfg) => {
+                        if let Ok(conn) = rustls::ServerConnection::new(cfg) {
+                            let mut t = rustls::StreamOwned::new(conn, stream);
+                            handle(&st, &mut t, peer.ip());
+                            t.conn.send_close_notify();
+                            let _ = t.flush();
+                        }
+                    }
+                    None => {
+                        let mut s = stream;
+                        handle(&st, &mut s, peer.ip());
+                    }
+                }
             }
             st.active.fetch_sub(1, Ordering::Relaxed);
         });

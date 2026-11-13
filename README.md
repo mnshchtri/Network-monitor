@@ -86,11 +86,11 @@ Hosts on the left, then per-host tabs: **Alerts**, **Listening ports** (with own
 
 ### Web dashboard
 
-The same views as the console UI in a browser: host list with live status, alert feed with acknowledge, and per-host Alerts / Listening ports / Connections / Changes tabs with filtering and a connection sparkline.
+The same views as the console UI in a browser, plus the access controls a team needs: host list with live status, alert feed, per-host Alerts / Listening ports / Connections / Changes tabs with filtering, active sessions, and an audit log.
 
 ```sh
-sudo netwatch server set-password     # required first: no default credentials (min 10 chars)
-sudo netwatch web                     # http://127.0.0.1:8080
+sudo netwatch server user add alice --role admin   # first account (prompts for a password, min 12 chars)
+sudo netwatch web                                  # http://127.0.0.1:8080
 ```
 
 It binds to loopback by default. From your laptop, tunnel over SSH and browse to `http://127.0.0.1:8080`:
@@ -99,9 +99,55 @@ It binds to loopback by default. From your laptop, tunnel over SSH and browse to
 ssh -L 8080:127.0.0.1:8080 you@server
 ```
 
-To serve it on a real hostname, put it behind an HTTPS reverse proxy (nginx/Caddy) and run `netwatch web --listen 127.0.0.1:8080 --allow-host netwatch.example.com --secure`. Do not expose the plain-HTTP listener directly.
+**HTTPS** is built in, no reverse proxy needed:
 
-Hardening: PBKDF2-SHA256 password hashing, `HttpOnly` + `SameSite=Strict` session cookie, lockout after 5 failed logins (5 minutes), Host-header allowlist (DNS-rebinding defence), CSRF checks on every state-changing request, strict Content-Security-Policy with no third-party assets, and every agent-supplied string rendered as text, never HTML. Sessions are in memory and last 8 hours.
+```sh
+sudo netwatch web --listen 0.0.0.0:8443 --cert /etc/ssl/netwatch.crt --key /etc/ssl/netwatch.key --allow-host netwatch.example.com
+sudo netwatch web --listen 127.0.0.1:8443 --tls      # the server's own CA-signed certificate (trust ca.pem in your browser)
+```
+
+HTTPS turns on HSTS and `Secure` cookies. Behind your own TLS proxy instead, use `--allow-host <name> --secure`. A non-loopback address without TLS prints a warning: don't do it.
+
+#### Accounts and roles
+
+| Role | Can |
+|---|---|
+| `viewer` | See hosts, alerts, ports, connections, changes |
+| `operator` | + acknowledge alerts |
+| `admin` | + audit log (view/export), see and revoke everyone's sessions |
+
+Roles are checked on the server for every request and take effect immediately, including for sessions that are already open. **Accounts are managed only from the server's command line**, so a hijacked dashboard session can never create admins or change roles:
+
+```sh
+sudo netwatch server user add bob --role operator    # bob must change the password at first login
+sudo netwatch server user list
+sudo netwatch server user role bob viewer
+sudo netwatch server user disable bob                # ends bob's open sessions immediately
+sudo netwatch server user passwd bob                 # reset; change is forced at next login
+sudo netwatch server user totp bob                   # enable two-factor (authenticator app)
+sudo netwatch server user totp-off bob
+```
+
+The last enabled admin cannot be disabled, demoted or deleted. Upgrading from a version with the single shared dashboard password converts it into an `admin` account (forced password change at first login).
+
+#### Security controls
+
+- Passwords: PBKDF2-SHA256, 12+ characters, must not contain the username. Login timing does not reveal whether a user exists.
+- Optional TOTP two-factor (RFC 6238, verified against the RFC test vector); a code cannot be used twice.
+- Sessions: `HttpOnly` + `SameSite=Strict` cookie, 30-minute idle timeout and 8-hour lifetime (`--idle-minutes`, `--session-hours`), "sign out everywhere", changing a password ends your other sessions.
+- Lockout: 5 failed logins from one IP or 10 for one account locks it for 5 minutes. (Per-account lockout means someone who knows a username can lock that user out for 5 minutes; that is the usual trade-off against guessing.)
+- Host-header allowlist (DNS rebinding), CSRF header and Origin checks, strict Content-Security-Policy with no third-party assets, agent-supplied text rendered as text, never HTML.
+
+#### Audit log
+
+Logins (and failures, lockouts), logouts, password changes, alert acknowledgements, session revocations, exports, every account change, setting change and agent revocation made from the CLI. Shown in the dashboard (admin) and from the server:
+
+```sh
+sudo netwatch server audit --limit 100       # or --json
+sudo netwatch server audit --verify          # recompute the integrity chain
+```
+
+Each entry includes the hash of the one before it, so editing an entry or deleting one from the middle is detected (by `--verify` and by a red banner in the dashboard). **Limit:** someone with write access to the database can rewrite the whole chain consistently, or truncate the end. To catch that, periodically record the `Head hash` that `--verify` prints somewhere the server cannot write to. Exports (CSV/JSON) neutralise spreadsheet formula injection.
 
 Server administration:
 

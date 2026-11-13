@@ -106,12 +106,12 @@ pub fn cmd(args: &[String]) {
         run_step(&exe, &["server", "init", "--name", "127.0.0.1", "--port", &port.to_string(), "--dir", &dir_s], "server init");
     }
     let dbc = db::open(&dir.join("netwatch.db")).unwrap_or_else(|e| fail(&format!("cannot open database: {e}")));
-    if want_web && db::get_setting(&dbc, "web_password").ok().flatten().unwrap_or_default().is_empty() {
+    if want_web && db::count_users(&dbc).unwrap_or(0) == 0 {
         if std::io::stdin().is_terminal() {
-            println!("[up] choose a password for the web dashboard:");
+            println!("[up] create the dashboard login (user: admin):");
             run_step(&exe, &["server", "set-password", "--dir", &dir_s], "set-password");
         } else {
-            eprintln!("[up] no dashboard password set and no terminal to ask: skipping the web dashboard.\n     Run 'netwatch server set-password' once, then start again.");
+            eprintln!("[up] no dashboard account exists and there is no terminal to ask: skipping the web dashboard.\n     Run 'netwatch server set-password' once, then start again.");
             want_web = false;
         }
     }

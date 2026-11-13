@@ -39,8 +39,12 @@ netwatch server - central collector
                           Server-only: down_after (seconds of silence before HOST_DOWN, default 90)
                           webhook_url (Slack/Discord/any https endpoint), webhook_min_severity
                           (INFO|MEDIUM|HIGH, default MEDIUM), webhook_format (auto|slack|discord|generic)
+    netwatch server user add|list|passwd|role|disable|enable|totp|totp-off|delete ...
+                          Manage dashboard accounts and roles (see 'netwatch server user')
+    netwatch server audit [--limit N] [--json] [--verify]
+                          Show the audit log, or verify its integrity chain
     netwatch server set-password [--dir D]
-                          Set the web dashboard password (prompted; or --password-stdin)
+                          Set the 'admin' account password (bootstrap)
     netwatch server webhook test [--dir D]
                           Send a test message to the configured webhook
     netwatch server config [--dir D]      Show settings
@@ -48,7 +52,7 @@ netwatch server - central collector
 Default dir: /var/lib/netwatch-server (root) or ~/.local/share/netwatch-server
 ";
 
-fn dir_of(args: &[String]) -> PathBuf {
+pub fn dir_of(args: &[String]) -> PathBuf {
     opt(args, "--dir").map(PathBuf::from).unwrap_or_else(default_server_dir)
 }
 
@@ -68,11 +72,13 @@ pub fn cmd(args: &[String]) {
         Some("config") => config(rest),
         Some("webhook") => webhook_cmd(rest),
         Some("set-password") => set_password(rest),
+        Some("user") => super::users::user_cmd(rest),
+        Some("audit") => super::users::audit_cmd(rest),
         _ => print!("{HELP}"),
     }
 }
 
-fn open_db(dir: &Path) -> rusqlite::Connection {
+pub fn open_db(dir: &Path) -> rusqlite::Connection {
     if !dir.join("server.pem").exists() {
         fail(&format!("{} is not initialised; run 'netwatch server init' first", dir.display()));
     }
@@ -137,7 +143,10 @@ fn revoke(args: &[String]) {
     let c = open_db(&dir_of(args));
     match db::revoke(&c, target) {
         Ok(0) => fail("no such host"),
-        Ok(n) => println!("revoked {n} host(s); the agent can no longer report"),
+        Ok(n) => {
+            let _ = db::audit(&c, &super::users::cli_actor(), "host.revoke", target, "agent certificate revoked", "");
+            println!("revoked {n} host(s); the agent can no longer report")
+        }
         Err(e) => fail(&format!("{e}")),
     }
 }
@@ -174,6 +183,7 @@ fn set(args: &[String]) {
     }
     let c = open_db(&dir_of(args));
     db::set_setting(&c, k, v).unwrap_or_else(|e| fail(&format!("{e}")));
+    let _ = db::audit(&c, &super::users::cli_actor(), "setting.set", k, &if k == "webhook_url" { webhook::mask(v) } else { v.to_string() }, "");
     if k.starts_with("webhook") || k == "down_after" {
         println!("{k} = {} (applies immediately; restart not needed)", if k == "webhook_url" { webhook::mask(v) } else { v.to_string() });
     } else {
@@ -194,7 +204,7 @@ fn config(args: &[String]) {
     }
 }
 
-fn read_secret(prompt: &str, tty: bool) -> String {
+pub fn read_secret(prompt: &str, tty: bool) -> String {
     use std::io::{BufRead, Write};
     if tty {
         eprint!("{prompt}");
@@ -210,19 +220,31 @@ fn read_secret(prompt: &str, tty: bool) -> String {
     line.trim_end_matches(['\n', '\r']).to_string()
 }
 
+/// Legacy/bootstrap command: set (or create) the `admin` account's password.
 fn set_password(args: &[String]) {
     use std::io::IsTerminal;
     let c = open_db(&dir_of(args));
     let tty = std::io::stdin().is_terminal() && !has(args, "--password-stdin");
-    let pw = read_secret("New web dashboard password: ", tty);
+    let pw = read_secret("New password for the admin account: ", tty);
     if tty && read_secret("Repeat password: ", true) != pw {
         fail("passwords do not match");
     }
-    if pw.chars().count() < 10 {
-        fail("password must be at least 10 characters");
+    if let Err(e) = super::auth::password_policy(&pw, "admin") {
+        fail(&e);
     }
-    db::set_setting(&c, "web_password", &super::web::hash_password(&pw)).unwrap_or_else(|e| fail(&format!("{e}")));
-    println!("web dashboard password set. Start it with: netwatch web");
+    let hash = super::auth::hash_password(&pw);
+    let actor = super::users::cli_actor();
+    match db::user_by_name(&c, "admin").unwrap_or_else(|e| fail(&format!("{e}"))) {
+        Some(u) => {
+            db::set_password(&c, u.id, &hash, false).unwrap_or_else(|e| fail(&format!("{e}")));
+            let _ = db::audit(&c, &actor, "user.passwd", "admin", "password set via server set-password", "");
+        }
+        None => {
+            db::add_user(&c, "admin", &hash, "admin", false).unwrap_or_else(|e| fail(&format!("{e}")));
+            let _ = db::audit(&c, &actor, "user.add", "admin", "role=admin (bootstrap)", "");
+        }
+    }
+    println!("admin password set. Start the dashboard with: netwatch web   (user: admin)");
 }
 
 fn webhook_cmd(args: &[String]) {

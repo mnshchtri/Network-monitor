@@ -297,11 +297,20 @@ fn install_signal_handlers() {
 }
 
 fn main() {
-    // Behave like a normal CLI when piped into head/less.
-    unsafe {
-        signal(13, 0); // SIGPIPE -> SIG_DFL
-    }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Short-lived commands should die quietly when piped into head/less (SIGPIPE default).
+    // Long-running ones (servers, agents, watchers) must NOT: a client that disconnects mid-write
+    // would otherwise kill the whole process. Rust ignores SIGPIPE by default, so leave those alone.
+    let long_running = match args.first().map(String::as_str) {
+        Some("watch" | "agent" | "web" | "up" | "tui") => true,
+        Some("server") => args.get(1).map(String::as_str) == Some("run"),
+        _ => false,
+    };
+    if !long_running {
+        unsafe {
+            signal(13, 0); // SIGPIPE -> SIG_DFL
+        }
+    }
     match args.first().map(String::as_str) {
         Some("ports") => list(&args[1..], true),
         Some("conns") => list(&args[1..], false),
