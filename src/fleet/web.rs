@@ -31,6 +31,7 @@ const USER_FAILS: u32 = 10;
 const INDEX: &str = include_str!("web/index.html");
 const CSS: &str = include_str!("web/app.css");
 const JS: &str = include_str!("web/app.js");
+const THEME_JS: &str = include_str!("web/theme.js");
 
 static HSTS: AtomicBool = AtomicBool::new(false);
 
@@ -394,6 +395,7 @@ fn handle<S: Read + Write>(st: &State, s: &mut S, peer: IpAddr) {
         ("GET", "/") => return send(s, 200, "text/html; charset=utf-8", "no-cache", &[], INDEX.as_bytes()),
         ("GET", "/app.css") => return send(s, 200, "text/css; charset=utf-8", "no-cache", &[], CSS.as_bytes()),
         ("GET", "/app.js") => return send(s, 200, "text/javascript; charset=utf-8", "no-cache", &[], JS.as_bytes()),
+        ("GET", "/theme.js") => return send(s, 200, "text/javascript; charset=utf-8", "no-cache", &[], THEME_JS.as_bytes()),
         _ => {}
     }
     if !req.path.starts_with("/api/") && req.path != "/metrics" {
@@ -489,7 +491,7 @@ fn login(st: &State, c: &rusqlite::Connection, s: &mut impl Write, req: &Req, pe
 fn host_json(h: &db::HostRow) -> Value {
     json!({"id": h.id, "name": h.name, "os": h.os, "version": h.version, "addr": h.addr, "status": h.status,
            "last_seen": h.last_seen, "is_root": h.is_root, "total": h.total, "established": h.established,
-           "syn_recv": h.syn_recv, "time_wait": h.time_wait, "listeners": h.listeners, "open_alerts": h.open_alerts, "tags": h.tags})
+           "syn_recv": h.syn_recv, "time_wait": h.time_wait, "listeners": h.listeners, "open_alerts": h.open_alerts, "tags": h.tags, "cert_expires": h.cert_expires})
 }
 
 fn alert_json(a: &db::AlertRow) -> Value {
@@ -644,6 +646,26 @@ fn route(st: &State, c: &rusqlite::Connection, req: &Req, s: &mut impl Write, a:
             }
             let list: Vec<Value> = db::users(c)?.iter().filter(|u| !u.disabled).map(|u| json!({"username": u.username, "role": u.role})).collect();
             json_resp(s, 200, json!({"users": list}));
+        }
+        ("GET", "/api/risk") => {
+            let r = db::risk(c)?;
+            let hosts = db::hosts(c)?;
+            let now = now_secs();
+            let expiring: Vec<Value> = hosts
+                .iter()
+                .filter(|h| h.cert_expires < now + 90 * 86400)
+                .map(|h| json!({"id": h.id, "name": h.name, "days": (h.cert_expires as i64 - now as i64).div_euclid(86400)}))
+                .collect();
+            json_resp(s, 200, json!({
+                "down": hosts.iter().filter(|h| h.status == "down").map(|h| json!({"id": h.id, "name": h.name, "last_seen": h.last_seen})).collect::<Vec<_>>(),
+                "non_root": hosts.iter().filter(|h| !h.is_root && h.status != "pending").map(|h| json!({"id": h.id, "name": h.name})).collect::<Vec<_>>(),
+                "cert_expiring": expiring,
+                "exposed": r.exposed.iter().map(alert_json_full).collect::<Vec<_>>(),
+                "sources": r.sources.iter().map(|(ip, n, kinds, last)| json!({"ip": ip, "count": n, "kinds": kinds, "last": last})).collect::<Vec<_>>(),
+                "kinds": r.kinds.iter().map(|(k, n)| json!({"kind": k, "count": n})).collect::<Vec<_>>(),
+                "unacked_high": r.unacked_high,
+                "mutes_active": r.active_mutes,
+            }));
         }
         ("GET", "/api/search") => {
             let q = req.query.get("q").map(|v| v.trim().to_string()).unwrap_or_default();

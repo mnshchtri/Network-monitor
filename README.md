@@ -138,6 +138,15 @@ The last enabled admin cannot be disabled, demoted or deleted. Upgrading from a 
 - Lockout: 5 failed logins from one IP or 10 for one account locks it for 5 minutes. (Per-account lockout means someone who knows a username can lock that user out for 5 minutes; that is the usual trade-off against guessing.)
 - Host-header allowlist (DNS rebinding), CSRF header and Origin checks, strict Content-Security-Policy with no third-party assets, agent-supplied text rendered as text, never HTML.
 
+#### Fleet overview, themes, keyboard and accessibility
+
+- **Fleet overview.** The landing page leads with what needs attention: hosts down, unacknowledged HIGH alerts, new externally reachable listeners, agent certificates expiring within 90 days, agents running without root, active maintenance windows, the top attacking sources of the last 24 hours and an activity-by-type breakdown. Click any item to jump to it. Muted alerts are excluded.
+- **Agent certificate expiry.** Agent certificates last until 1 January of (issue year + 5). The server tracks this per host and flags certificates within 90 days of expiry (re-enroll with `netwatch agent enroll --force`). Hosts enrolled before this tracking existed are derived from their enrollment date.
+- **Light and dark themes.** Follows your system setting by default; the header button or `t` switches and remembers the choice. The theme is applied before the first paint, so there is no flash.
+- **Keyboard.** `/` search, `g a` overview, `g m` maintenance, `g s` sessions, `g u` audit log, `j`/`k` move between table rows, `Enter` opens, `t` theme, `?` help, `Esc` closes panels.
+- **Accessibility.** Skip link, labelled landmarks and controls, a live region for connection changes, focus-trapped dialogs that return focus when closed, keyboard focus preserved across the 3-second refresh, status shown as text as well as colour, and respect for reduced-motion. Text/background contrast meets WCAG AA (4.5:1) in both themes; all 52 colour pairs were computed from the stylesheet.
+- **Phones and tablets.** Below 820 px the host list becomes a slide-in menu and wide tables scroll sideways.
+
 #### Working with many hosts
 
 - **Tags and groups.** Operators tag hosts (`prod`, `db`, `eu-west`; up to 10 per host, `a-z 0-9 - .`) from the host page. Tag chips at the top of the sidebar filter the host list and the alert feed.

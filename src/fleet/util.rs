@@ -76,7 +76,12 @@ pub fn kernel() -> String {
 
 /// Current year from the unix clock (UTC).
 pub fn current_year() -> i32 {
-    let days = (now_secs() / 86400) as i64 + 719468;
+    year_at(now_secs())
+}
+
+/// Calendar year (UTC) of a unix timestamp.
+pub fn year_at(ts: u64) -> i32 {
+    let days = (ts / 86400) as i64 + 719468;
     let era = days.div_euclid(146097);
     let doe = days.rem_euclid(146097);
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
@@ -123,4 +128,30 @@ pub fn has(args: &[String], name: &str) -> bool {
 pub fn fail(msg: &str) -> ! {
     eprintln!("netwatch: {msg}");
     std::process::exit(1);
+}
+
+/// Unix time of 00:00:00 UTC on the given civil date (Howard Hinnant's days_from_civil).
+pub fn ymd_to_unix(y: i32, m: u32, d: u32) -> u64 {
+    let y = y as i64 - if m <= 2 { 1 } else { 0 };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    ((era * 146097 + doe - 719468) * 86400).max(0) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_dates() {
+        assert_eq!(ymd_to_unix(1970, 1, 1), 0);
+        assert_eq!(ymd_to_unix(2000, 3, 1), 951868800);
+        assert_eq!(ymd_to_unix(2031, 1, 1), 1924992000);
+        assert_eq!(year_at(1924992000), 2031);
+        assert_eq!(year_at(1924991999), 2030);
+        assert_eq!(fmt_time(ymd_to_unix(2026, 11, 14)), "2026-11-14 00:00:00");
+    }
 }

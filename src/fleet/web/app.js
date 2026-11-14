@@ -3,10 +3,16 @@
 const $app = document.getElementById("app");
 const S = { me: null, view: "hosts", hosts: [], openAlerts: 0, sel: null, tab: "alerts", tag: null,
   showAcked: false, filter: "", data: null, alerts: [], online: true, timer: null, sessions: [], audit: null,
-  aRange: "24h", aSev: "", aMine: false, cRange: "6h", metrics: null, timeline: null, mutes: [], q: "", search: null, drawer: null, editTags: false };
+  risk: null, nav: false, aRange: "24h", aSev: "", aMine: false, cRange: "6h", metrics: null, timeline: null, mutes: [], q: "", search: null, drawer: null, editTags: false };
 const canAck = () => S.me && (S.me.role === "operator" || S.me.role === "admin");
 const RANGES = { "1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000, "all": 0 };
 const KINDS = ["NEW_LISTENER", "PORT_SCAN", "BRUTE_FORCE", "CONN_BURST", "CONN_FLOOD", "SYN_FLOOD", "SYN_COOKIES", "LISTEN_OVERFLOW", "RST_STORM", "HOST_DOWN", "HOST_UP"];
+const tbl = (...kids) => h("div", { class: "tablewrap" }, h("table", {}, ...kids));
+const dot = status => h("span", { class: "dot " + status, role: "img", "aria-label": "status: " + status, title: status });
+function announce(msg) { const l = document.getElementById("live"); if (l) { l.textContent = ""; setTimeout(() => { l.textContent = msg; }, 30); } }
+const curTheme = () => document.documentElement.dataset.theme;
+function setTheme(t) { document.documentElement.dataset.theme = t; try { localStorage.setItem("nw_theme", t); } catch (e) {} announce(t + " theme"); render(); }
+if (window.matchMedia) matchMedia("(prefers-color-scheme: light)").addEventListener("change", e => { let s = null; try { s = localStorage.getItem("nw_theme"); } catch (x) {} if (!s) { document.documentElement.dataset.theme = e.matches ? "light" : "dark"; } });
 function sel(options, value, onchange, label) {
   const s = h("select", { "aria-label": label || "", onchange: e => onchange(e.target.value) }, options.map(([v, t]) => h("option", { value: v }, t)));
   s.value = value; return s;
@@ -94,7 +100,9 @@ async function refresh() {
     if (!S.me || S.me.must_change === undefined) S.me = await api("/api/me");
     if (S.me.must_change) return showChangePassword();
     const sum = await api("/api/summary");
-    S.hosts = sum.hosts; S.openAlerts = sum.open_alerts; S.online = true;
+    S.hosts = sum.hosts; S.openAlerts = sum.open_alerts;
+    if (!S.online) announce("Connection restored");
+    S.online = true;
     if (S.tag && !S.hosts.some(x => x.tags.includes(S.tag))) S.tag = null;
     if (S.view === "sessions") S.sessions = (await api("/api/sessions")).sessions;
     else if (S.view === "audit") S.audit = await api("/api/audit?limit=500");
@@ -102,7 +110,7 @@ async function refresh() {
     else if (S.view === "search") { /* loaded on submit */ }
     else {
       if (S.sel && !S.hosts.some(x => x.id === S.sel)) S.sel = null;
-      if (!S.sel) { S.data = null; S.alerts = (await api(alertQuery())).alerts; }
+      if (!S.sel) { S.data = null; S.risk = await api("/api/risk"); S.alerts = (await api(alertQuery())).alerts; }
       else {
         S.data = await api("/api/host/" + S.sel);
         if (S.tab === "alerts") S.alerts = (await api(alertQuery("&host=" + S.sel))).alerts;
@@ -110,7 +118,7 @@ async function refresh() {
         else if (S.tab === "timeline") S.timeline = (await api("/api/host/" + S.sel + "/timeline")).events;
       }
     }
-  } catch (e) { if (e.message === "login") return; S.online = false; }
+  } catch (e) { if (e.message === "login") return; if (S.online) announce("Server unreachable"); S.online = false; }
   render();
 }
 async function runSearch() {
@@ -120,22 +128,44 @@ async function runSearch() {
   try { S.search = await api("/api/search?q=" + encodeURIComponent(q)); } catch (e) { if (e.message === "login") return; S.search = { error: e.message }; }
   render();
 }
-const go = (view, sel, tab) => { S.view = view; S.sel = sel ?? null; S.tab = tab || "alerts"; S.filter = ""; S.data = null; S.editTags = false; refresh(); };
+function setNav(open) { S.nav = open; document.body.classList.toggle("nav-open", open); const b = document.getElementById("burger"); if (b) b.setAttribute("aria-expanded", String(open)); }
+const go = (view, sel, tab) => { setNav(false); S.view = view; S.sel = sel ?? null; S.tab = tab || "alerts"; S.filter = ""; S.data = null; S.editTags = false; refresh(); };
 
 /* ---------- rendering ---------- */
 function shell() {
   if (document.getElementById("shell")) return;
   $app.replaceChildren(h("div", { id: "shell", class: "shell" }, h("header", { id: "hdr" }),
-    h("main", {}, h("aside", { id: "side" }), h("section", { id: "content", class: "content" })), h("div", { id: "drawer" })));
+    h("main", {}, h("aside", { id: "side", "aria-label": "Hosts and sections" }), h("section", { id: "content", class: "content", tabindex: "-1", "aria-label": "Main content" })),
+    h("div", { id: "drawer" }), h("div", { id: "navscrim", onclick: () => setNav(false) }), h("div", { id: "help" }),
+    h("div", { id: "live", class: "sr", role: "status", "aria-live": "polite" })));
+}
+/* The page re-renders on every poll; remember which control had keyboard focus and put it back,
+   otherwise keyboard-only users lose their place every few seconds. */
+const FOCUSABLE = "[tabindex='0'], button, select, a[href], input, textarea";
+function saveFocus() {
+  const a = document.activeElement; if (!a || a === document.body) return null;
+  for (const id of ["content", "side", "hdr"]) {
+    const root = document.getElementById(id);
+    if (root && root.contains(a)) { const i = [...root.querySelectorAll(FOCUSABLE)].indexOf(a); if (i >= 0) return { id, i, tag: a.tagName }; }
+  }
+  return null;
+}
+function restoreFocus(f) {
+  if (!f) return;
+  const root = document.getElementById(f.id); if (!root) return;
+  const list = [...root.querySelectorAll(FOCUSABLE)], el = list[Math.min(f.i, list.length - 1)];
+  if (el && el.tagName === f.tag && el !== document.activeElement) el.focus({ preventScroll: true });
 }
 function render() {
   shell();
+  const savedFocus = saveFocus();
   const up = S.hosts.filter(x => x.status === "up").length, down = S.hosts.filter(x => x.status === "down").length;
   const hdr = document.getElementById("hdr");
   const keepSearch = document.activeElement && document.activeElement.id === "gsearch";
   const box = h("input", { type: "search", id: "gsearch", class: "gsearch", placeholder: "Search hosts, ports, processes, IPs, alerts…", value: S.q, "aria-label": "Search",
     oninput: e => { S.q = e.target.value; }, onkeydown: e => { if (e.key === "Enter") runSearch(); } });
   hdr.replaceChildren(
+    h("button", { id: "burger", class: "burger icon", "aria-label": "Open menu", "aria-expanded": String(S.nav), "aria-controls": "side", onclick: () => setNav(!S.nav) }, "☰"),
     h("div", { class: "brand" }, "net", h("span", {}, "watch")),
     h("div", { class: "stat" }, h("b", {}, S.hosts.length), "hosts"),
     h("div", { class: "stat ok" }, h("b", {}, up), "up"),
@@ -143,21 +173,23 @@ function render() {
     h("div", { class: "stat" + (S.openAlerts ? " warn" : "") }, h("b", {}, S.openAlerts), "open alerts"),
     box, h("div", { class: "grow" }),
     h("div", { class: "conn" + (S.online ? "" : " dead") }, S.online ? "● live" : "● server unreachable"),
-    h("div", { class: "userbox" }, h("span", {}, S.me.username), h("span", { class: "role " + S.me.role }, S.me.role),
+    h("div", { class: "userbox" }, h("button", { class: "icon", title: "Keyboard shortcuts (?)", "aria-label": "Keyboard shortcuts", onclick: toggleHelp }, "?"),
+      h("button", { class: "icon", title: "Switch theme (t)", "aria-label": "Switch to " + (curTheme() === "light" ? "dark" : "light") + " theme", onclick: () => setTheme(curTheme() === "light" ? "dark" : "light") }, curTheme() === "light" ? "☾" : "☀"),
+      h("span", {}, S.me.username), h("span", { class: "role " + S.me.role }, S.me.role),
       h("button", { onclick: async () => { await api("/api/logout", {}).catch(() => {}); showLogin(); } }, "Sign out")));
   if (keepSearch) { box.focus(); box.setSelectionRange(box.value.length, box.value.length); }
 
   const side = document.getElementById("side");
   const tags = [...new Set(S.hosts.flatMap(x => x.tags))].sort();
   const shown = S.hosts.filter(x => !S.tag || x.tags.includes(S.tag));
-  const item = (id, dot, name, sub, badge) => h("div", { class: "host" + (S.view === "hosts" && S.sel === id ? " sel" : ""), tabindex: "0", role: "button", onclick: () => go("hosts", id),
+  const item = (id, dot, name, sub, badge) => h("div", { class: "host" + (S.view === "hosts" && S.sel === id ? " sel" : ""), tabindex: "0", role: "button", "aria-current": S.view === "hosts" && S.sel === id ? "page" : null, onclick: () => go("hosts", id),
     onkeydown: e => { if (e.key === "Enter") go("hosts", id); } }, dot, h("div", { class: "n" }, h("div", {}, name), sub && h("div", { class: "sub" }, sub)), badge ? h("span", { class: "badge" }, badge) : null);
-  const nav = (view, label) => h("div", { class: "navitem" + (S.view === view ? " sel" : ""), tabindex: "0", role: "button", onclick: () => go(view), onkeydown: e => { if (e.key === "Enter") go(view); } }, label);
+  const nav = (view, label) => h("div", { class: "navitem" + (S.view === view ? " sel" : ""), tabindex: "0", role: "button", "aria-current": S.view === view ? "page" : null, onclick: () => go(view), onkeydown: e => { if (e.key === "Enter") go(view); } }, label);
   side.replaceChildren(...[
     tags.length ? h("div", { class: "tagbar" }, h("span", { class: "chip" + (S.tag ? "" : " on"), onclick: () => { S.tag = null; refresh(); } }, "all"),
       tags.map(t => h("span", { class: "chip" + (S.tag === t ? " on" : ""), onclick: () => { S.tag = S.tag === t ? null : t; S.sel = null; refresh(); } }, t))) : null,
     item(null, h("span", {}, "★"), S.tag ? "All hosts · " + S.tag : "All hosts", null, S.tag ? shown.reduce((n, x) => n + x.open_alerts, 0) : S.openAlerts),
-    ...shown.map(x => item(x.id, h("span", { class: "dot " + x.status }), x.name, x.status === "up" ? x.addr : x.status + " · " + ago(x.last_seen), x.open_alerts)),
+    ...shown.map(x => item(x.id, dot(x.status), x.name, x.status === "up" ? x.addr : x.status + " · " + ago(x.last_seen), x.open_alerts)),
     h("div", { class: "side-nav" }, nav("maint", "Maintenance"), nav("sessions", "Sessions"), S.me.role === "admin" && nav("audit", "Audit log"))].filter(k => k != null && k !== false));
 
   const c = document.getElementById("content"), keep = c.scrollTop;
@@ -167,9 +199,31 @@ function render() {
   else if (S.view === "maint") kids = maintView();
   else if (S.view === "search") kids = searchView();
   else if (!S.hosts.length) kids = [h("div", { class: "empty" }, "No agents enrolled yet. Run ", h("code", {}, "netwatch server token"), " on the server and follow the printed command on a host to monitor.")];
-  else kids = S.sel && S.data ? hostView() : [h("div", { class: "title" }, h("h2", {}, "Alert feed · " + (S.tag ? "hosts tagged " + S.tag : "all hosts"))), alertsBar(), alertsTable(true)];
+  else kids = S.sel && S.data ? hostView() : [h("div", { class: "title" }, h("h2", {}, "Fleet overview")), riskView(), h("div", { class: "title" }, h("h2", {}, "Alert feed · " + (S.tag ? "hosts tagged " + S.tag : "all hosts"))), alertsBar(), alertsTable(true)];
   c.replaceChildren(...kids.filter(k => k != null && k !== false));
   c.scrollTop = keep;
+  restoreFocus(savedFocus);
+}
+
+/* ----- fleet risk summary ----- */
+function riskView() {
+  const r = S.risk; if (!r) return null;
+  const card = (k, v, cls) => h("div", { class: "rcard" + (v > 0 && cls ? " " + cls : "") }, h("div", { class: "k" }, k), h("div", { class: "v" }, v));
+  const item = (lead, text, onclick, sub) => h("div", { class: "ritem", tabindex: "0", role: "button", onclick, onkeydown: e => { if (e.key === "Enter") onclick(); } }, lead, h("div", { class: "grow" }, text, sub && h("div", { class: "dim" }, sub)));
+  const attention = [
+    ...r.down.map(x => item(h("span", { class: "sev HIGH" }, "DOWN"), x.name, () => go("hosts", x.id), "silent since " + ago(x.last_seen))),
+    ...r.exposed.map(a => item(h("span", { class: "sev HIGH" }, "NEW PORT"), a.message, () => openAlert(a.id), a.host + " · " + ago(a.ts))),
+    ...r.cert_expiring.map(x => item(h("span", { class: "sev MEDIUM" }, "CERT"), x.name + (x.days < 0 ? " agent certificate expired" : " agent certificate expires in " + x.days + " days"), () => go("hosts", x.id), "re-enroll with: netwatch agent enroll --force")),
+    ...r.non_root.map(x => item(h("span", { class: "sev INFO" }, "NO ROOT"), x.name, () => go("hosts", x.id), "process names are missing for other users' sockets"))];
+  const max = Math.max(1, ...r.kinds.map(k => k.count));
+  const bars = r.kinds.map(k => { const f = h("div", { class: "barfill" }); f.style.width = Math.max(2, k.count / max * 100) + "%"; return h("div", { class: "barrow" }, h("span", { class: "mono" }, k.kind), h("div", { class: "bartrack" }, f), h("span", {}, k.count)); });
+  return h("div", {},
+    h("div", { class: "riskcards" }, card("Hosts down", r.down.length, "bad"), card("Unacked HIGH alerts", r.unacked_high, "bad"), card("New external listeners", r.exposed.length, "bad"),
+      card("Certs expiring ≤ 90 d", r.cert_expiring.length, "warn"), card("Agents without root", r.non_root.length, "warn"), card("Active maintenance", r.mutes_active)),
+    h("div", { class: "riskgrid" },
+      h("div", { class: "rpanel" }, h("h4", {}, "Needs attention"), attention.length ? attention : h("div", { class: "dim" }, "Nothing needs attention ✔")),
+      h("div", { class: "rpanel" }, h("h4", {}, "Top sources, last 24 h"), r.sources.length ? r.sources.map(x => item(h("b", {}, x.count + "×"), h("span", { class: "mono" }, x.ip), () => { S.q = x.ip; runSearch(); }, x.kinds.join(", ") + " · last " + ago(x.last))) : h("div", { class: "dim" }, "No attributed activity.")),
+      h("div", { class: "rpanel" }, h("h4", {}, "Activity by type, last 24 h"), bars.length ? bars : h("div", { class: "dim" }, "Quiet."))));
 }
 
 /* ----- alerts ----- */
@@ -186,7 +240,7 @@ function alertsBar() {
 }
 function alertsTable(withHost) {
   if (!S.alerts.length) return h("div", { class: "empty" }, "No alerts match. ✔");
-  return h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "Time"), withHost && h("th", {}, "Host"), h("th", {}, "Severity"), h("th", {}, "Type"), h("th", {}, "Message"), h("th", {}, "Assigned"), h("th", {}, ""))),
+  return tbl(h("thead", {}, h("tr", {}, h("th", {}, "Time"), withHost && h("th", {}, "Host"), h("th", {}, "Severity"), h("th", {}, "Type"), h("th", {}, "Message"), h("th", {}, "Assigned"), h("th", {}, ""))),
     h("tbody", {}, S.alerts.map(a => h("tr", { class: "click" + (a.acked || a.muted ? " acked" : ""), tabindex: "0", onclick: () => openAlert(a.id), onkeydown: e => { if (e.key === "Enter") openAlert(a.id); } },
       h("td", { title: when(a.ts) }, ago(a.ts)), withHost && h("td", {}, a.host), h("td", {}, h("span", { class: "sev " + a.severity }, a.severity)),
       h("td", { class: "mono" }, a.kind), h("td", {}, a.message, a.muted && h("span", { class: "tagpill" }, "muted")), h("td", {}, a.assignee || ""),
@@ -194,8 +248,9 @@ function alertsTable(withHost) {
 }
 
 /* ----- alert drawer (assign + comments) ----- */
-function closeDrawer() { S.drawer = null; document.getElementById("drawer").replaceChildren(); }
+function closeDrawer() { S.drawer = null; document.getElementById("drawer").replaceChildren(); if (S.returnFocus && document.contains(S.returnFocus)) S.returnFocus.focus(); S.returnFocus = null; }
 async function openAlert(id) {
+  if (!S.drawer) S.returnFocus = document.activeElement;
   S.drawer = id;
   let d, users = [];
   try { d = await api("/api/alert/" + id); if (canAck()) users = (await api("/api/users")).users; } catch (e) { return; }
@@ -214,9 +269,52 @@ async function openAlert(id) {
     h("h4", {}, "Notes"),
     d.comments.length ? d.comments.map(c => h("div", { class: "comment" }, h("div", { class: "dim" }, c.author + " · " + when(c.ts)), h("div", { class: "cbody" }, c.body))) : h("div", { class: "dim" }, "No notes yet."),
     canAck() && h("div", { class: "cform" }, ta, h("button", { class: "primary", onclick: () => act(async () => { if (!ta.value.trim()) throw new Error("write something first"); await api("/api/alert/comment", { id, body: ta.value }); }) }, "Add note"), err)));
-  box.querySelector(".drawer button").focus();
+  const dr = box.querySelector(".drawer");
+  dr.addEventListener("keydown", e => {
+    if (e.key !== "Tab") return;
+    const f = [...dr.querySelectorAll("button, select, textarea, input, a[href]")].filter(x => !x.disabled && x.offsetParent !== null);
+    if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  });
+  dr.querySelector("button").focus();
 }
-document.addEventListener("keydown", e => { if (e.key === "Escape" && S.drawer) closeDrawer(); });
+const SHORTCUTS = [["/", "Focus the search box"], ["g a", "Fleet overview and alert feed"], ["g m", "Maintenance windows"], ["g s", "Sessions"], ["g u", "Audit log (admins)"],
+  ["j / k", "Next / previous row in a table"], ["Enter", "Open the focused row"], ["t", "Switch light / dark theme"], ["?", "Show or hide this help"], ["Esc", "Close the open panel"]];
+function toggleHelp() {
+  const box = document.getElementById("help");
+  if (box.firstChild) { box.replaceChildren(); if (S.helpReturn) S.helpReturn.focus(); return; }
+  S.helpReturn = document.activeElement;
+  const close = h("button", { class: "primary", onclick: toggleHelp }, "Close");
+  box.replaceChildren(h("div", { class: "help", onclick: e => { if (e.target.classList.contains("help")) toggleHelp(); } },
+    h("div", { class: "helpbox", role: "dialog", "aria-modal": "true", "aria-label": "Keyboard shortcuts" }, h("h3", {}, "Keyboard shortcuts"),
+      tbl(h("tbody", {}, SHORTCUTS.map(([k, t]) => h("tr", {}, h("td", {}, k.split(" ").map(x => x === "/" && k.length > 1 ? " / " : h("kbd", {}, x))), h("td", {}, t))))), close)));
+  close.focus();
+}
+let gAt = 0;
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") { if (document.getElementById("help").firstChild) toggleHelp(); else if (S.drawer) closeDrawer(); else if (S.nav) setNav(false); return; }
+  if (!S.me || e.metaKey || e.ctrlKey || e.altKey) return;
+  const t = e.target;
+  if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable)) return;
+  if (S.me.must_change) return;
+  const k = e.key;
+  if (Date.now() - gAt < 1200) {
+    gAt = 0;
+    const dest = { a: () => go("hosts"), m: () => go("maint"), s: () => go("sessions"), u: () => S.me.role === "admin" && go("audit") }[k];
+    if (dest) { e.preventDefault(); dest(); return; }
+  }
+  if (k === "g") { gAt = Date.now(); return; }
+  if (k === "/") { e.preventDefault(); const b = document.getElementById("gsearch"); if (b) { setNav(false); b.focus(); b.select(); } }
+  else if (k === "?") { e.preventDefault(); toggleHelp(); }
+  else if (k === "t") setTheme(curTheme() === "light" ? "dark" : "light");
+  else if (k === "j" || k === "k") {
+    const rows = [...document.querySelectorAll("#content tr.click")]; if (!rows.length) return;
+    const i = rows.indexOf(document.activeElement), n = k === "j" ? Math.min(rows.length - 1, i + 1) : Math.max(0, i < 0 ? 0 : i - 1);
+    e.preventDefault(); rows[n].focus(); rows[n].scrollIntoView({ block: "nearest" });
+  }
+});
 
 /* ----- host page ----- */
 const card = (k, v, bad) => h("div", { class: "card" + (bad ? " bad" : "") }, h("div", { class: "k" }, k), h("div", { class: "v" }, v));
@@ -239,25 +337,25 @@ function hostView() {
   else if (S.tab === "timeline") body = timelineView();
   else if (S.tab === "ports") {
     const rows = d.listeners.filter(l => match(l.proto, l.addr, l.port, l.process, l.user, l.pid));
-    body = [h("div", { class: "bar" }, search), rows.length ? h("table", {}, h("thead", {}, h("tr", {}, ["Proto", "Address", "Port", "PID", "Process", "User", "Scope", "Open for"].map(t => h("th", {}, t)))),
+    body = [h("div", { class: "bar" }, search), rows.length ? tbl(h("thead", {}, h("tr", {}, ["Proto", "Address", "Port", "PID", "Process", "User", "Scope", "Open for"].map(t => h("th", {}, t)))),
       h("tbody", {}, rows.map(l => { const ext = !(l.addr.startsWith("127.") || l.addr === "::1");
         return h("tr", {}, h("td", {}, l.proto), h("td", { class: "mono" }, l.addr), h("td", { class: "mono" }, l.port), h("td", {}, l.pid ?? "-"), h("td", {}, l.process), h("td", {}, l.user), h("td", { class: ext ? "ext" : "" }, ext ? "external" : "local"), h("td", {}, ago(l.first_seen))); }))) : h("div", { class: "empty" }, "No listeners.")];
   } else if (S.tab === "conns") {
     const rows = d.conns.filter(c => match(c.proto, c.state, c.local, c.remote, c.process, c.pid));
-    body = [h("div", { class: "bar" }, search, h("span", { class: "note" }, `${rows.length} of ${d.conns_total}`)), rows.length ? h("table", {}, h("thead", {}, h("tr", {}, ["Proto", "State", "Local", "Remote", "PID", "Process"].map(t => h("th", {}, t)))),
+    body = [h("div", { class: "bar" }, search, h("span", { class: "note" }, `${rows.length} of ${d.conns_total}`)), rows.length ? tbl(h("thead", {}, h("tr", {}, ["Proto", "State", "Local", "Remote", "PID", "Process"].map(t => h("th", {}, t)))),
       h("tbody", {}, rows.slice(0, 1500).map(c => h("tr", {}, h("td", {}, c.proto), h("td", { class: "st-" + c.state }, c.state), h("td", { class: "mono" }, c.local), h("td", { class: "mono" }, c.remote), h("td", {}, c.pid ?? "-"), h("td", {}, c.process))))) : h("div", { class: "empty" }, "No connections.")];
   } else {
     const rows = d.events.filter(e => match(e.what, e.event));
-    body = [h("div", { class: "bar" }, search), rows.length ? h("table", {}, h("thead", {}, h("tr", {}, ["Time", "Event", "Listener"].map(t => h("th", {}, t)))),
+    body = [h("div", { class: "bar" }, search), rows.length ? tbl(h("thead", {}, h("tr", {}, ["Time", "Event", "Listener"].map(t => h("th", {}, t)))),
       h("tbody", {}, rows.map(e => h("tr", {}, h("td", {}, when(e.ts)), h("td", { class: "ev-" + e.event }, e.event.toUpperCase()), h("td", { class: "mono" }, e.what))))) : h("div", { class: "empty" }, "No listener changes recorded yet."),
       h("div", { class: "note" }, "Ports that opened or closed after the agent's first report: the first thing to check in an investigation.")];
   }
   return [
-    h("div", { class: "title" }, h("span", { class: "dot " + x.status }), h("h2", {}, x.name), h("span", { class: "pill" }, x.status), h("span", { class: "pill" }, "seen " + ago(x.last_seen)), h("span", { class: "pill" }, x.addr)),
+    h("div", { class: "title" }, dot(x.status), h("h2", {}, x.name), h("span", { class: "pill" }, x.status), h("span", { class: "pill" }, "seen " + ago(x.last_seen)), h("span", { class: "pill" }, x.addr)),
     tagEditor(x), h("div", { class: "note" }, `${x.os} · agent ${x.version} · id ${x.id}`),
     !x.is_root && h("div", { class: "warnbar" }, "Agent is not running as root: process names are missing for other users' sockets."),
     h("div", { class: "cards" }, card("Listening", x.listeners), card("Established", x.established), card("SYN_RECV", x.syn_recv, x.syn_recv > 10), card("TIME_WAIT", x.time_wait), card("Total sockets", x.total), card("Open alerts", x.open_alerts, x.open_alerts > 0)),
-    h("div", { class: "tabs", role: "tablist" }, TABS.map(([k, label]) => h("div", { class: "tab" + (S.tab === k ? " sel" : ""), role: "tab", tabindex: "0", onclick: () => { S.tab = k; S.filter = ""; refresh(); }, onkeydown: e => { if (e.key === "Enter") { S.tab = k; S.filter = ""; refresh(); } } }, label))),
+    h("div", { class: "tabs", role: "tablist" }, TABS.map(([k, label]) => h("div", { class: "tab" + (S.tab === k ? " sel" : ""), role: "tab", "aria-selected": String(S.tab === k), tabindex: "0", onclick: () => { S.tab = k; S.filter = ""; refresh(); }, onkeydown: e => { if (e.key === "Enter") { S.tab = k; S.filter = ""; refresh(); } } }, label))),
     ...body];
 }
 
@@ -269,30 +367,30 @@ function lineChart(title, color, t, vals, since, until, unit) {
   box.append(h("div", { class: "ctitle" }, h("span", {}, title), h("span", { class: "dim" }, vals.length ? `now ${vals[vals.length - 1]} · peak ${Math.max(...vals)}` : "")));
   if (vals.length < 2) { box.append(h("div", { class: "note" }, "Not enough data in this window yet (reports arrive every few seconds).")); return box; }
   const ymax = niceMax(Math.max(...vals, 1)), X = ts => L + (ts - since) / span * (W - L - R), Y = v => T + (1 - v / ymax) * (H - T - B);
-  const svgEl = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": title + " over time" });
+  const svgEl = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": title + " over time", class: color });
   for (let i = 0; i <= 4; i++) {
     const v = ymax * i / 4, y = Y(v);
-    svgEl.append(svg("line", { x1: L, x2: W - R, y1: y, y2: y, stroke: "#2a323d", "stroke-width": "1" }));
-    const tx = svg("text", { x: L - 6, y: y + 4, "text-anchor": "end", fill: "#8b96a3", "font-size": "11" }); tx.textContent = Number.isInteger(v) ? v : v.toFixed(1); svgEl.append(tx);
+    svgEl.append(svg("line", { x1: L, x2: W - R, y1: y, y2: y, class: "grid" }));
+    const tx = svg("text", { x: L - 6, y: y + 4, "text-anchor": "end", class: "axis" }); tx.textContent = Number.isInteger(v) ? v : v.toFixed(1); svgEl.append(tx);
   }
   for (let i = 0; i <= 5; i++) {
-    const ts = since + span * i / 5, tx = svg("text", { x: X(ts), y: H - 6, "text-anchor": i === 0 ? "start" : i === 5 ? "end" : "middle", fill: "#8b96a3", "font-size": "11" }); tx.textContent = fmtTick(ts, span); svgEl.append(tx);
+    const ts = since + span * i / 5, tx = svg("text", { x: X(ts), y: H - 6, "text-anchor": i === 0 ? "start" : i === 5 ? "end" : "middle", class: "axis" }); tx.textContent = fmtTick(ts, span); svgEl.append(tx);
   }
   const pts = t.map((ts, i) => X(ts).toFixed(1) + "," + Y(vals[i]).toFixed(1));
-  svgEl.append(svg("polygon", { points: `${X(t[0]).toFixed(1)},${Y(0)} ${pts.join(" ")} ${X(t[t.length - 1]).toFixed(1)},${Y(0)}`, fill: color, "fill-opacity": "0.12" }),
-    svg("polyline", { points: pts.join(" "), fill: "none", stroke: color, "stroke-width": "2", "stroke-linejoin": "round" }));
-  const guide = svg("line", { y1: T, y2: H - B, stroke: "#8b96a3", "stroke-dasharray": "3 3", visibility: "hidden" }), dot = svg("circle", { r: "4", fill: color, visibility: "hidden" });
-  svgEl.append(guide, dot);
+  svgEl.append(svg("polygon", { points: `${X(t[0]).toFixed(1)},${Y(0)} ${pts.join(" ")} ${X(t[t.length - 1]).toFixed(1)},${Y(0)}`, class: "area" }),
+    svg("polyline", { points: pts.join(" "), class: "ln" }));
+  const guide = svg("line", { y1: T, y2: H - B, class: "guide", visibility: "hidden" }), dotEl = svg("circle", { r: "4", class: "dotp", visibility: "hidden" });
+  svgEl.append(guide, dotEl);
   const tip = h("div", { class: "tip", hidden: true });
   svgEl.addEventListener("mousemove", ev => {
     const r = svgEl.getBoundingClientRect(), ts = since + ((ev.clientX - r.left) / r.width * W - L) / (W - L - R) * span;
     let best = 0; for (let i = 1; i < t.length; i++) if (Math.abs(t[i] - ts) < Math.abs(t[best] - ts)) best = i;
     const x = X(t[best]); guide.setAttribute("x1", x); guide.setAttribute("x2", x); guide.setAttribute("visibility", "visible");
-    dot.setAttribute("cx", x); dot.setAttribute("cy", Y(vals[best])); dot.setAttribute("visibility", "visible");
+    dotEl.setAttribute("cx", x); dotEl.setAttribute("cy", Y(vals[best])); dotEl.setAttribute("visibility", "visible");
     tip.hidden = false; tip.textContent = `${new Date(t[best] * 1000).toLocaleString()}  ·  ${vals[best]} ${unit}`;
     tip.style.left = Math.min(Math.max(x / W * r.width - 10, 0), r.width - 230) + "px";
   });
-  svgEl.addEventListener("mouseleave", () => { tip.hidden = true; guide.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden"); });
+  svgEl.addEventListener("mouseleave", () => { tip.hidden = true; guide.setAttribute("visibility", "hidden"); dotEl.setAttribute("visibility", "hidden"); });
   box.append(svgEl, tip); return box;
 }
 function trendsView() {
@@ -300,9 +398,9 @@ function trendsView() {
   const bar = h("div", { class: "bar" }, h("div", { class: "seg" }, ["1h", "6h", "24h", "7d"].map(r => h("button", { class: S.cRange === r ? "on" : "", onclick: () => { S.cRange = r; S.metrics = null; refresh(); } }, r))),
     h("span", { class: "note" }, "Each point is the highest value in its time bucket, so short spikes are never averaged away."));
   if (!m) return [bar, h("div", { class: "empty" }, "Loading…")];
-  return [bar, lineChart("Established connections", "#4cc2ff", m.t, m.established, m.since, m.until, "connections"),
-    lineChart("Half-open connections (SYN_RECV): a flood shows up here", "#f85149", m.t, m.syn_recv, m.since, m.until, "half-open"),
-    lineChart("TIME_WAIT", "#e3b341", m.t, m.time_wait, m.since, m.until, "sockets"), lineChart("Listening sockets: a step up means a port was opened", "#3fb950", m.t, m.listeners, m.since, m.until, "listeners")];
+  return [bar, lineChart("Established connections", "c-accent", m.t, m.established, m.since, m.until, "connections"),
+    lineChart("Half-open connections (SYN_RECV): a flood shows up here", "c-bad", m.t, m.syn_recv, m.since, m.until, "half-open"),
+    lineChart("TIME_WAIT", "c-warn", m.t, m.time_wait, m.since, m.until, "sockets"), lineChart("Listening sockets: a step up means a port was opened", "c-ok", m.t, m.listeners, m.since, m.until, "listeners")];
 }
 
 /* ----- timeline ----- */
@@ -326,7 +424,7 @@ function maintView() {
       h("div", { class: "note" }, "Matching alerts are still recorded and shown (marked muted) but don't count as open alerts and aren't sent to the webhook."));
   })();
   return [h("div", { class: "title" }, h("h2", {}, "Maintenance windows")), form,
-    S.mutes.length ? h("table", {}, h("thead", {}, h("tr", {}, ["Status", "Scope", "Alert type", "Until", "Reason", "By", ""].map(t => h("th", {}, t)))),
+    S.mutes.length ? tbl(h("thead", {}, h("tr", {}, ["Status", "Scope", "Alert type", "Until", "Reason", "By", ""].map(t => h("th", {}, t)))),
       h("tbody", {}, S.mutes.map(m => h("tr", { class: m.active ? "" : "acked" }, h("td", {}, m.active ? h("span", { class: "sev MEDIUM" }, "ACTIVE") : "ended"), h("td", {}, m.host_id ? m.host || m.host_id : "all hosts"), h("td", { class: "mono" }, m.kind || "any"),
         h("td", { title: when(m.until) }, m.active ? "in " + untilStr(m.until) : when(m.until)), h("td", {}, m.reason), h("td", {}, m.created_by),
         h("td", {}, m.active && canAck() ? h("button", { class: "danger", onclick: async () => { await api("/api/mutes/end", { id: m.id }); refresh(); } }, "End now") : ""))))) : h("div", { class: "empty" }, "No maintenance windows yet.")];
@@ -339,7 +437,7 @@ function searchView() {
   if (r.loading) return [h("div", { class: "empty" }, "Searching…")];
   if (r.error) return [h("div", { class: "title" }, h("h2", {}, "Search")), h("div", { class: "empty" }, r.error)];
   const sect = (title, rows, head, cells, target) => rows.length ? [h("h4", {}, `${title} (${rows.length}${rows.length >= 50 ? "+" : ""})`),
-    h("table", {}, h("thead", {}, h("tr", {}, head.map(t => h("th", {}, t)))), h("tbody", {}, rows.map(x => h("tr", { class: "click", tabindex: "0", onclick: () => target(x), onkeydown: e => { if (e.key === "Enter") target(x); } }, cells(x)))))] : [];
+    tbl(h("thead", {}, h("tr", {}, head.map(t => h("th", {}, t)))), h("tbody", {}, rows.map(x => h("tr", { class: "click", tabindex: "0", onclick: () => target(x), onkeydown: e => { if (e.key === "Enter") target(x); } }, cells(x)))))] : [];
   const none = !(r.hosts.length || r.listeners.length || r.conns.length || r.alerts.length);
   return [h("div", { class: "title" }, h("h2", {}, `Search: “${S.q.trim()}”`)), none ? h("div", { class: "empty" }, "No matches in hosts, listening ports, connections or alerts.") : null,
     ...sect("Hosts", r.hosts, ["Host", "Address", "Tags"], x => [h("td", {}, x.name), h("td", { class: "mono" }, x.addr), h("td", {}, x.tags.join(", "))], x => go("hosts", x.id)),
@@ -353,7 +451,7 @@ function sessionsView() {
   return [h("div", { class: "title" }, h("h2", {}, admin ? "Active sessions · all users" : "Your sessions")),
     h("div", { class: "bar" }, h("div", { class: "grow" }),
       h("button", { class: "danger", onclick: async () => { if (!confirm("Sign out of every session of your account, including this one?")) return; await api("/api/logout-all", {}).catch(() => {}); showLogin(); } }, "Sign out everywhere")),
-    S.sessions.length ? h("table", {}, h("thead", {}, h("tr", {}, ["User", "From", "Signed in", "Last active", ""].map(t => h("th", {}, t)))),
+    S.sessions.length ? tbl(h("thead", {}, h("tr", {}, ["User", "From", "Signed in", "Last active", ""].map(t => h("th", {}, t)))),
       h("tbody", {}, S.sessions.map(x => h("tr", {}, h("td", {}, x.user, x.current && h("span", { class: "cur" }, "  (this session)")), h("td", { class: "mono" }, x.ip), h("td", { title: when(x.created) }, ago(x.created)), h("td", {}, ago(x.last)),
         h("td", {}, x.current ? "" : h("button", { class: "danger", onclick: async () => { await api("/api/sessions/revoke", { id: x.id }); refresh(); } }, "Revoke")))))) : h("div", { class: "empty" }, "No sessions."),
     h("div", { class: "note" }, "Sessions end after inactivity or at the absolute lifetime. Changing your password ends your other sessions.")];
@@ -367,7 +465,7 @@ function auditView() {
   return [h("div", { class: "title" }, h("h2", {}, "Audit log")),
     h("div", { class: "integrity " + (d.integrity.ok ? "ok" : "bad") }, d.integrity.ok ? `✔ Integrity verified: ${d.integrity.entries} entries, hash chain intact` : "✖ INTEGRITY FAILURE: " + d.integrity.error),
     h("div", { class: "bar" }, search, h("div", { class: "grow" }), h("a", { class: "btn", href: "/api/audit?format=csv&limit=20000", download: "netwatch-audit.csv" }, "Export CSV"), h("a", { class: "btn", href: "/api/audit?format=json&limit=20000", download: "netwatch-audit.json" }, "Export JSON")),
-    rows.length ? h("table", {}, h("thead", {}, h("tr", {}, ["Time", "Actor", "Action", "Target", "Detail", "From"].map(t => h("th", {}, t)))),
+    rows.length ? tbl(h("thead", {}, h("tr", {}, ["Time", "Actor", "Action", "Target", "Detail", "From"].map(t => h("th", {}, t)))),
       h("tbody", {}, rows.map(e => h("tr", {}, h("td", { title: String(e.ts) }, when(e.ts)), h("td", {}, e.actor), h("td", { class: "mono" }, e.action), h("td", {}, e.target), h("td", {}, e.detail), h("td", { class: "mono" }, e.ip))))) : h("div", { class: "empty" }, "No matching entries."),
     h("div", { class: "note" }, "Each entry commits to the hash of the one before it. Verify from the server with `netwatch server audit --verify`.")];
 }
@@ -379,7 +477,8 @@ function start() {
   S.timer = setInterval(() => {
     const id = document.activeElement?.id;
     // Don't rebuild the page under the user's hands: typing in a filter/search box, or reading a chart tooltip.
-    if (!document.hidden && id !== "filter" && id !== "gsearch" && S.view !== "search" && !document.querySelector(".chart:hover")) refresh();
+    const tag = document.activeElement?.tagName;
+    if (!document.hidden && id !== "filter" && id !== "gsearch" && tag !== "SELECT" && tag !== "TEXTAREA" && S.view !== "search" && !document.querySelector(".chart:hover")) refresh();
   }, 3000);
 }
 api("/api/me").then(m => { S.me = m; start(); }).catch(() => { if (!document.getElementById("shell") && !S.me) showLogin(); });

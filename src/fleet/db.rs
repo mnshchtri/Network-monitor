@@ -1,7 +1,7 @@
 //! SQLite storage shared by the server (writer) and the console UI (reader/acker).
 
 use super::proto::{RemoteConfig, Report};
-use super::util::{clean, now_secs, random_hex, sha256_hex};
+use super::util::{clean, now_secs, random_hex, sha256_hex, year_at, ymd_to_unix};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::path::Path;
@@ -19,6 +19,7 @@ pub fn open(path: &Path) -> Res<Connection> {
     add_column(&c, "hosts", "tags", "TEXT NOT NULL DEFAULT ''");
     add_column(&c, "alerts", "assignee", "TEXT");
     add_column(&c, "alerts", "muted", "INTEGER NOT NULL DEFAULT 0");
+    add_column(&c, "hosts", "cert_expires", "INTEGER NOT NULL DEFAULT 0");
     migrate_users(&c)?;
     Ok(c)
 }
@@ -109,10 +110,15 @@ pub fn consume_token(c: &Connection, token: &str) -> Res<bool> {
     Ok(n == 1)
 }
 
+/// Agent certificates are issued valid until 1 January of (issue year + 5), see pki::sign_csr.
+pub fn cert_expiry_for(issued: u64) -> u64 {
+    ymd_to_unix(year_at(issued) + 5, 1, 1)
+}
+
 pub fn add_host(c: &Connection, id: &str, name: &str, fp: &str, addr: &str) -> Res<()> {
     c.execute(
-        "INSERT INTO hosts(id, name, cert_fp, remote_addr, first_seen, last_seen, status) VALUES(?1,?2,?3,?4,?5,?5,'pending')",
-        params![id, clean(name, 64), fp, addr, now_secs() as i64],
+        "INSERT INTO hosts(id, name, cert_fp, remote_addr, first_seen, last_seen, status, cert_expires) VALUES(?1,?2,?3,?4,?5,?5,'pending',?6)",
+        params![id, clean(name, 64), fp, addr, now_secs() as i64, cert_expiry_for(now_secs()) as i64],
     )?;
     Ok(())
 }
@@ -313,13 +319,14 @@ pub struct HostRow {
     pub listeners: u32,
     pub open_alerts: u32,
     pub tags: Vec<String>,
+    pub cert_expires: u64,
 }
 
 pub fn hosts(c: &Connection) -> Res<Vec<HostRow>> {
     let mut st = c.prepare(
         "SELECT h.id, h.name, h.os, h.version, h.remote_addr, h.status, h.last_seen, h.is_root, h.total,
                 h.established, h.syn_recv, h.time_wait, h.listeners,
-                (SELECT COUNT(*) FROM alerts a WHERE a.host_id = h.id AND a.acked = 0 AND a.severity != 'INFO' AND a.muted = 0), h.tags
+                (SELECT COUNT(*) FROM alerts a WHERE a.host_id = h.id AND a.acked = 0 AND a.severity != 'INFO' AND a.muted = 0), h.tags, h.cert_expires, h.first_seen
          FROM hosts h WHERE h.revoked = 0 ORDER BY (h.status = 'down') DESC, 14 DESC, h.name",
     )?;
     let rows = st.query_map([], |r| {
@@ -329,6 +336,11 @@ pub fn hosts(c: &Connection) -> Res<Vec<HostRow>> {
             total: r.get(8)?, established: r.get(9)?, syn_recv: r.get(10)?, time_wait: r.get(11)?,
             listeners: r.get(12)?, open_alerts: r.get(13)?,
             tags: r.get::<_, String>(14)?.split(',').filter(|t| !t.is_empty()).map(String::from).collect(),
+            // Hosts enrolled before expiry tracking existed: derive it from the enrollment date.
+            cert_expires: match r.get::<_, i64>(15)? {
+                0 => cert_expiry_for(r.get::<_, i64>(16)?.max(0) as u64),
+                v => v as u64,
+            },
         })
     })?;
     rows.collect()
@@ -805,4 +817,40 @@ pub fn audit_verify(c: &Connection) -> Result<usize, String> {
         n += 1;
     }
     Ok(n)
+}
+
+
+// ---------- fleet risk summary ----------
+
+pub struct Risk {
+    pub exposed: Vec<AlertRow>,
+    pub sources: Vec<(String, u32, Vec<String>, u64)>,
+    pub kinds: Vec<(String, u32)>,
+    pub unacked_high: u32,
+    pub active_mutes: u32,
+}
+
+/// What an on-call person wants first: unacknowledged externally reachable new listeners, who is
+/// hitting us, and what kind of activity dominates the last 24 hours. Muted alerts are excluded.
+pub fn risk(c: &Connection) -> Res<Risk> {
+    let since = now_secs().saturating_sub(86400) as i64;
+    let exposed = alerts_filtered(c, &AlertFilter { kind: Some("NEW_LISTENER"), severity: Some("HIGH"), limit: 8, ..Default::default() })?
+        .into_iter()
+        .filter(|a| !a.muted)
+        .collect();
+    let mut st = c.prepare(
+        "SELECT source, COUNT(*), GROUP_CONCAT(DISTINCT kind), MAX(ts) FROM alerts
+         WHERE ts >= ?1 AND source IS NOT NULL AND muted = 0 GROUP BY source ORDER BY COUNT(*) DESC, MAX(ts) DESC LIMIT 6",
+    )?;
+    let sources = st
+        .query_map([since], |r| {
+            let kinds: String = r.get(2)?;
+            Ok((r.get(0)?, r.get(1)?, kinds.split(',').map(String::from).collect(), r.get::<_, i64>(3)? as u64))
+        })?
+        .collect::<Res<_>>()?;
+    let mut st = c.prepare("SELECT kind, COUNT(*) FROM alerts WHERE ts >= ?1 AND muted = 0 GROUP BY kind ORDER BY COUNT(*) DESC LIMIT 8")?;
+    let kinds = st.query_map([since], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Res<_>>()?;
+    let unacked_high: u32 = c.query_row("SELECT COUNT(*) FROM alerts WHERE severity = 'HIGH' AND acked = 0 AND muted = 0", [], |r| r.get(0))?;
+    let active_mutes = mutes(c)?.iter().filter(|m| m.active).count() as u32;
+    Ok(Risk { exposed, sources, kinds, unacked_high, active_mutes })
 }
