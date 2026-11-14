@@ -197,3 +197,29 @@ kbd{font:12px ui-monospace,Menlo,Consolas,monospace;background:var(--panel2);bor
   .tablewrap table{min-width:680px}
   .bar input[type=search]{width:100%}
 }
+
+/* phase 4: insight pages */
+.navgroup{padding:12px 16px 4px;font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--dim)}
+.navitem{display:flex;align-items:center;gap:10px}
+.navitem .ico{width:18px;text-align:center;color:var(--dim)}.navitem.sel .ico{color:var(--accent)}
+.navitem .grow{flex:1}
+.count{color:var(--dim);font-size:12px}
+.side-nav{border-top:1px solid var(--line)}
+.warnpill{border-color:var(--warn-line);color:var(--warn)}
+.twocol{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:12px}
+.rpanel.wide{grid-column:1/-1}
+.kvgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:10px}
+.kvgrid .v{font-size:26px;font-weight:700}.kvgrid .v.bad,.v.bad{color:var(--bad)}
+.kv2{display:flex;justify-content:space-between;padding:4px 0;border-top:1px solid var(--line)}.kv2:first-of-type{border-top:0}
+.cmd{display:flex;gap:8px;align-items:center;margin:5px 0;flex-wrap:wrap}.cmd code{flex:1;min-width:0;overflow-wrap:anywhere;background:var(--bg);border:1px solid var(--line);border-radius:5px;padding:3px 8px;font-size:12px}
+.barfill.bad{background:var(--bad)}
+.legend{display:flex;gap:12px;align-items:center;font-size:12px}.legend .dim{margin-left:6px}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px}
+.sw.b-high,.chart svg rect.b-high{fill:var(--bad);background:var(--bad)}.sw.b-medium,.chart svg rect.b-medium{fill:var(--warn);background:var(--warn)}.sw.b-info,.chart svg rect.b-info{fill:var(--info);background:var(--info)}
+th.sortable{cursor:pointer;user-select:none}th.sortable:hover{color:var(--text)}
+tr.subrow td{background:var(--panel);font-size:13px}
+.check{display:flex;gap:10px;align-items:baseline;padding:6px 0;border-top:1px solid var(--line)}.check:first-of-type{border-top:0}
+.check .ck{width:18px;text-align:center;font-weight:700}
+.check.ok .ck{color:var(--ok)}.check.warn .ck{color:var(--warn)}.check.bad .ck{color:var(--bad)}.check.info .ck{color:var(--info)}
+.title .grow{flex:1}
+@media(max-width:820px){.kvgrid{grid-template-columns:1fr 1fr 1fr}.twocol{grid-template-columns:1fr}}

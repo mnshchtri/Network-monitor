@@ -1,9 +1,9 @@
 "use strict";
 // All dynamic content goes through textContent (never innerHTML), so agent-supplied data cannot inject markup.
 const $app = document.getElementById("app");
-const S = { me: null, view: "hosts", hosts: [], openAlerts: 0, sel: null, tab: "alerts", tag: null,
+const S = { me: null, view: "overview", hosts: [], openAlerts: 0, sel: null, tab: "alerts", tag: null,
   showAcked: false, filter: "", data: null, alerts: [], online: true, timer: null, sessions: [], audit: null,
-  risk: null, nav: false, aRange: "24h", aSev: "", aMine: false, cRange: "6h", metrics: null, timeline: null, mutes: [], q: "", search: null, drawer: null, editTags: false };
+  risk: null, ov: null, ovRange: "24h", exposure: null, traffic: null, threats: null, tRange: "24h", source: null, srcData: null, health: null, expanded: {}, expOnly: true, expRisky: false, hSort: { k: "status", dir: 1 }, riskyExposed: 0, threatSources: 0, nav: false, aRange: "24h", aSev: "", aMine: false, cRange: "6h", metrics: null, timeline: null, mutes: [], q: "", search: null, drawer: null, editTags: false };
 const canAck = () => S.me && (S.me.role === "operator" || S.me.role === "admin");
 const RANGES = { "1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000, "all": 0 };
 const KINDS = ["NEW_LISTENER", "PORT_SCAN", "BRUTE_FORCE", "CONN_BURST", "CONN_FLOOD", "SYN_FLOOD", "SYN_COOKIES", "LISTEN_OVERFLOW", "RST_STORM", "HOST_DOWN", "HOST_UP"];
@@ -100,23 +100,31 @@ async function refresh() {
     if (!S.me || S.me.must_change === undefined) S.me = await api("/api/me");
     if (S.me.must_change) return showChangePassword();
     const sum = await api("/api/summary");
-    S.hosts = sum.hosts; S.openAlerts = sum.open_alerts;
+    S.hosts = sum.hosts; S.openAlerts = sum.open_alerts; S.riskyExposed = sum.risky_exposed || 0; S.threatSources = sum.threat_sources || 0;
     if (!S.online) announce("Connection restored");
     S.online = true;
     if (S.tag && !S.hosts.some(x => x.tags.includes(S.tag))) S.tag = null;
-    if (S.view === "sessions") S.sessions = (await api("/api/sessions")).sessions;
-    else if (S.view === "audit") S.audit = await api("/api/audit?limit=500");
-    else if (S.view === "maint") S.mutes = (await api("/api/mutes")).mutes;
-    else if (S.view === "search") { /* loaded on submit */ }
-    else {
-      if (S.sel && !S.hosts.some(x => x.id === S.sel)) S.sel = null;
-      if (!S.sel) { S.data = null; S.risk = await api("/api/risk"); S.alerts = (await api(alertQuery())).alerts; }
-      else {
+    switch (S.view) {
+      case "sessions": S.sessions = (await api("/api/sessions")).sessions; break;
+      case "audit": S.audit = await api("/api/audit?limit=500"); break;
+      case "maint": S.mutes = (await api("/api/mutes")).mutes; break;
+      case "search": case "hostlist": break;
+      case "overview": S.risk = await api("/api/risk"); S.ov = await api("/api/insights/overview?range=" + S.ovRange); break;
+      case "alerts": S.alerts = (await api(alertQuery())).alerts; break;
+      case "threats":
+        if (S.source) { S.srcData = await api("/api/insights/source?ip=" + encodeURIComponent(S.source)); }
+        else S.threats = (await api("/api/insights/threats?range=" + S.tRange)).sources;
+        break;
+      case "exposure": S.exposure = await api("/api/insights/exposure"); break;
+      case "traffic": S.traffic = await api("/api/insights/traffic"); break;
+      case "health": S.health = await api("/api/insights/health"); break;
+      default:
+        if (S.sel && !S.hosts.some(x => x.id === S.sel)) S.sel = null;
+        if (!S.sel) { S.view = "overview"; S.risk = await api("/api/risk"); S.ov = await api("/api/insights/overview?range=" + S.ovRange); break; }
         S.data = await api("/api/host/" + S.sel);
         if (S.tab === "alerts") S.alerts = (await api(alertQuery("&host=" + S.sel))).alerts;
         else if (S.tab === "trends") S.metrics = await api("/api/host/" + S.sel + "/metrics?range=" + S.cRange);
         else if (S.tab === "timeline") S.timeline = (await api("/api/host/" + S.sel + "/timeline")).events;
-      }
     }
   } catch (e) { if (e.message === "login") return; if (S.online) announce("Server unreachable"); S.online = false; }
   render();
@@ -129,7 +137,13 @@ async function runSearch() {
   render();
 }
 function setNav(open) { S.nav = open; document.body.classList.toggle("nav-open", open); const b = document.getElementById("burger"); if (b) b.setAttribute("aria-expanded", String(open)); }
-const go = (view, sel, tab) => { setNav(false); S.view = view; S.sel = sel ?? null; S.tab = tab || "alerts"; S.filter = ""; S.data = null; S.editTags = false; refresh(); };
+const go = (view, sel, tab) => {
+  setNav(false);
+  if (view === "hosts" && !sel) view = "overview";
+  if (view !== "threats") S.source = null;
+  S.view = view; S.sel = sel ?? null; S.tab = tab || "alerts"; S.filter = ""; S.data = null; S.editTags = false; refresh();
+};
+const goSource = ip => { S.source = ip; S.srcData = null; go("threats"); };
 
 /* ---------- rendering ---------- */
 function shell() {
@@ -182,24 +196,30 @@ function render() {
   const side = document.getElementById("side");
   const tags = [...new Set(S.hosts.flatMap(x => x.tags))].sort();
   const shown = S.hosts.filter(x => !S.tag || x.tags.includes(S.tag));
-  const item = (id, dot, name, sub, badge) => h("div", { class: "host" + (S.view === "hosts" && S.sel === id ? " sel" : ""), tabindex: "0", role: "button", "aria-current": S.view === "hosts" && S.sel === id ? "page" : null, onclick: () => go("hosts", id),
-    onkeydown: e => { if (e.key === "Enter") go("hosts", id); } }, dot, h("div", { class: "n" }, h("div", {}, name), sub && h("div", { class: "sub" }, sub)), badge ? h("span", { class: "badge" }, badge) : null);
-  const nav = (view, label) => h("div", { class: "navitem" + (S.view === view ? " sel" : ""), tabindex: "0", role: "button", "aria-current": S.view === view ? "page" : null, onclick: () => go(view), onkeydown: e => { if (e.key === "Enter") go(view); } }, label);
+  const admin = S.me.role === "admin";
+  const hostItem = x => h("div", { class: "host" + (S.view === "hosts" && S.sel === x.id ? " sel" : ""), tabindex: "0", role: "button", "aria-current": S.view === "hosts" && S.sel === x.id ? "page" : null, onclick: () => go("hosts", x.id),
+    onkeydown: e => { if (e.key === "Enter") go("hosts", x.id); } }, dot(x.status), h("div", { class: "n" }, h("div", {}, x.name), h("div", { class: "sub" }, x.status === "up" ? x.addr : x.status + " · " + ago(x.last_seen))), x.open_alerts ? h("span", { class: "badge" }, x.open_alerts) : null);
+  const nav = (view, label, icon, badge, badgeClass) => h("div", { class: "navitem" + (S.view === view ? " sel" : ""), tabindex: "0", role: "button", "aria-current": S.view === view ? "page" : null,
+    onclick: () => { S.source = null; go(view); }, onkeydown: e => { if (e.key === "Enter") { S.source = null; go(view); } } },
+    h("span", { class: "ico", "aria-hidden": "true" }, icon), h("span", { class: "grow" }, label), badge ? h("span", { class: badgeClass || "count" }, badge) : null);
+  const group = t => h("div", { class: "navgroup" }, t);
   side.replaceChildren(...[
     tags.length ? h("div", { class: "tagbar" }, h("span", { class: "chip" + (S.tag ? "" : " on"), onclick: () => { S.tag = null; refresh(); } }, "all"),
-      tags.map(t => h("span", { class: "chip" + (S.tag === t ? " on" : ""), onclick: () => { S.tag = S.tag === t ? null : t; S.sel = null; refresh(); } }, t))) : null,
-    item(null, h("span", {}, "★"), S.tag ? "All hosts · " + S.tag : "All hosts", null, S.tag ? shown.reduce((n, x) => n + x.open_alerts, 0) : S.openAlerts),
-    ...shown.map(x => item(x.id, dot(x.status), x.name, x.status === "up" ? x.addr : x.status + " · " + ago(x.last_seen), x.open_alerts)),
-    h("div", { class: "side-nav" }, nav("maint", "Maintenance"), nav("sessions", "Sessions"), S.me.role === "admin" && nav("audit", "Audit log"))].filter(k => k != null && k !== false));
+      tags.map(t => h("span", { class: "chip" + (S.tag === t ? " on" : ""), onclick: () => { S.tag = S.tag === t ? null : t; refresh(); } }, t))) : null,
+    group("Monitor"), nav("overview", "Overview", "◈"), nav("alerts", "Alerts", "⚠", S.openAlerts || "", "badge"), nav("hostlist", "Hosts", "▤", S.hosts.length),
+    group("Analyze"), nav("threats", "Threat sources", "☠", S.threatSources || ""), nav("exposure", "Exposure", "◎", S.riskyExposed || "", "badge"), nav("traffic", "Traffic", "⇅"),
+    group("Manage"), nav("maint", "Maintenance", "⚒"), admin && nav("health", "System health", "♥"),
+    group("Hosts" + (S.tag ? " · " + S.tag : "")), ...shown.map(hostItem),
+    h("div", { class: "side-nav" }, nav("sessions", "Sessions", "⚿"), admin && nav("audit", "Audit log", "☰"))].filter(k => k != null && k !== false));
 
   const c = document.getElementById("content"), keep = c.scrollTop;
   let kids;
-  if (S.view === "sessions") kids = sessionsView();
-  else if (S.view === "audit" && S.me.role === "admin") kids = auditView();
-  else if (S.view === "maint") kids = maintView();
-  else if (S.view === "search") kids = searchView();
-  else if (!S.hosts.length) kids = [h("div", { class: "empty" }, "No agents enrolled yet. Run ", h("code", {}, "netwatch server token"), " on the server and follow the printed command on a host to monitor.")];
-  else kids = S.sel && S.data ? hostView() : [h("div", { class: "title" }, h("h2", {}, "Fleet overview")), riskView(), h("div", { class: "title" }, h("h2", {}, "Alert feed · " + (S.tag ? "hosts tagged " + S.tag : "all hosts"))), alertsBar(), alertsTable(true)];
+  const VIEWS = { overview: overviewView, alerts: alertsPage, hostlist: hostsPage, threats: threatsView, exposure: exposureView, traffic: trafficView, health: healthView, maint: maintView, sessions: sessionsView, search: searchView };
+  if (S.view === "audit" && admin) kids = auditView();
+  else if (S.view === "health" && !admin) kids = [h("div", { class: "empty" }, "System health is available to admins.")];
+  else if (S.view === "hosts" && S.sel && S.data) kids = hostView();
+  else if (!S.hosts.length && ["overview", "alerts", "hostlist"].includes(S.view)) kids = [h("div", { class: "empty" }, "No agents enrolled yet. Run ", h("code", {}, "netwatch server token"), " on the server and follow the printed command on a host to monitor.")];
+  else kids = (VIEWS[S.view] || overviewView)();
   c.replaceChildren(...kids.filter(k => k != null && k !== false));
   c.scrollTop = keep;
   restoreFocus(savedFocus);
@@ -219,10 +239,11 @@ function riskView() {
   const bars = r.kinds.map(k => { const f = h("div", { class: "barfill" }); f.style.width = Math.max(2, k.count / max * 100) + "%"; return h("div", { class: "barrow" }, h("span", { class: "mono" }, k.kind), h("div", { class: "bartrack" }, f), h("span", {}, k.count)); });
   return h("div", {},
     h("div", { class: "riskcards" }, card("Hosts down", r.down.length, "bad"), card("Unacked HIGH alerts", r.unacked_high, "bad"), card("New external listeners", r.exposed.length, "bad"),
+      card("Risky exposed services", S.ov ? S.ov.exposure.risky : 0, "bad"), card("Threat sources, 24 h", S.threatSources, "warn"),
       card("Certs expiring ≤ 90 d", r.cert_expiring.length, "warn"), card("Agents without root", r.non_root.length, "warn"), card("Active maintenance", r.mutes_active)),
     h("div", { class: "riskgrid" },
       h("div", { class: "rpanel" }, h("h4", {}, "Needs attention"), attention.length ? attention : h("div", { class: "dim" }, "Nothing needs attention ✔")),
-      h("div", { class: "rpanel" }, h("h4", {}, "Top sources, last 24 h"), r.sources.length ? r.sources.map(x => item(h("b", {}, x.count + "×"), h("span", { class: "mono" }, x.ip), () => { S.q = x.ip; runSearch(); }, x.kinds.join(", ") + " · last " + ago(x.last))) : h("div", { class: "dim" }, "No attributed activity.")),
+      h("div", { class: "rpanel" }, h("h4", {}, "Top sources, last 24 h"), r.sources.length ? r.sources.map(x => item(h("b", {}, x.count + "×"), h("span", { class: "mono" }, x.ip), () => goSource(x.ip), x.kinds.join(", ") + " · last " + ago(x.last))) : h("div", { class: "dim" }, "No attributed activity.")),
       h("div", { class: "rpanel" }, h("h4", {}, "Activity by type, last 24 h"), bars.length ? bars : h("div", { class: "dim" }, "Quiet."))));
 }
 
@@ -238,10 +259,10 @@ function alertsBar() {
     h("a", { class: "btn", href: q("csv"), download: "netwatch-alerts.csv" }, "CSV"), h("a", { class: "btn", href: q("json"), download: "netwatch-alerts.json" }, "JSON"),
     canAck() && h("button", { onclick: async () => { await api("/api/ack", { all: true, host: S.sel }); refresh(); } }, "Acknowledge all"));
 }
-function alertsTable(withHost) {
-  if (!S.alerts.length) return h("div", { class: "empty" }, "No alerts match. ✔");
+function alertsTable(withHost, rows = S.alerts) {
+  if (!rows.length) return h("div", { class: "empty" }, "No alerts match. ✔");
   return tbl(h("thead", {}, h("tr", {}, h("th", {}, "Time"), withHost && h("th", {}, "Host"), h("th", {}, "Severity"), h("th", {}, "Type"), h("th", {}, "Message"), h("th", {}, "Assigned"), h("th", {}, ""))),
-    h("tbody", {}, S.alerts.map(a => h("tr", { class: "click" + (a.acked || a.muted ? " acked" : ""), tabindex: "0", onclick: () => openAlert(a.id), onkeydown: e => { if (e.key === "Enter") openAlert(a.id); } },
+    h("tbody", {}, rows.map(a => h("tr", { class: "click" + (a.acked || a.muted ? " acked" : ""), tabindex: "0", onclick: () => openAlert(a.id), onkeydown: e => { if (e.key === "Enter") openAlert(a.id); } },
       h("td", { title: when(a.ts) }, ago(a.ts)), withHost && h("td", {}, a.host), h("td", {}, h("span", { class: "sev " + a.severity }, a.severity)),
       h("td", { class: "mono" }, a.kind), h("td", {}, a.message, a.muted && h("span", { class: "tagpill" }, "muted")), h("td", {}, a.assignee || ""),
       h("td", {}, a.acked || !canAck() ? "" : h("button", { onclick: async e => { e.stopPropagation(); await api("/api/ack", { id: a.id }); refresh(); } }, "Ack"))))));
@@ -280,7 +301,8 @@ async function openAlert(id) {
   });
   dr.querySelector("button").focus();
 }
-const SHORTCUTS = [["/", "Focus the search box"], ["g a", "Fleet overview and alert feed"], ["g m", "Maintenance windows"], ["g s", "Sessions"], ["g u", "Audit log (admins)"],
+const SHORTCUTS = [["/", "Focus the search box"], ["g o", "Overview"], ["g a", "Alerts"], ["g h", "Hosts"], ["g t", "Threat sources"], ["g e", "Exposure"], ["g n", "Traffic"],
+  ["g m", "Maintenance"], ["g y", "System health (admins)"], ["g s", "Sessions"], ["g u", "Audit log (admins)"],
   ["j / k", "Next / previous row in a table"], ["Enter", "Open the focused row"], ["t", "Switch light / dark theme"], ["?", "Show or hide this help"], ["Esc", "Close the open panel"]];
 function toggleHelp() {
   const box = document.getElementById("help");
@@ -302,7 +324,7 @@ document.addEventListener("keydown", e => {
   const k = e.key;
   if (Date.now() - gAt < 1200) {
     gAt = 0;
-    const dest = { a: () => go("hosts"), m: () => go("maint"), s: () => go("sessions"), u: () => S.me.role === "admin" && go("audit") }[k];
+    const dest = { o: () => go("overview"), a: () => go("alerts"), h: () => go("hostlist"), t: () => { S.source = null; go("threats"); }, e: () => go("exposure"), n: () => go("traffic"), m: () => go("maint"), y: () => S.me.role === "admin" && go("health"), s: () => go("sessions"), u: () => S.me.role === "admin" && go("audit") }[k];
     if (dest) { e.preventDefault(); dest(); return; }
   }
   if (k === "g") { gAt = Date.now(); return; }
@@ -470,9 +492,196 @@ function auditView() {
     h("div", { class: "note" }, "Each entry commits to the hash of the one before it. Verify from the server with `netwatch server audit --verify`.")];
 }
 
+
+/* ===================== insight pages ===================== */
+const pill = (text, cls) => h("span", { class: "tagpill " + (cls || "") }, text);
+const intTag = internal => pill(internal ? "internal" : "external", internal ? "" : "warnpill");
+const kindTags = kinds => h("span", {}, kinds.map(k => pill(k)));
+const fmtBytes = n => n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " KB" : n < 1073741824 ? (n / 1048576).toFixed(1) + " MB" : (n / 1073741824).toFixed(2) + " GB";
+const fmtDur = s => s < 60 ? s + "s" : s < 3600 ? Math.floor(s / 60) + "m" : s < 86400 ? Math.floor(s / 3600) + "h " + Math.floor(s % 3600 / 60) + "m" : Math.floor(s / 86400) + "d " + Math.floor(s % 86400 / 3600) + "h";
+function copyBtn(text) {
+  const b = h("button", { class: "link", onclick: async () => { try { await navigator.clipboard.writeText(text); b.textContent = "copied ✔"; announce("Copied"); } catch (e) { b.textContent = "copy failed"; } setTimeout(() => { b.textContent = "copy"; }, 1500); } }, "copy");
+  return b;
+}
+const barList = (rows, label, count, cls) => { const max = Math.max(1, ...rows.map(count)); return rows.map(r => { const f = h("div", { class: "barfill " + (cls ? cls(r) : "") }); f.style.width = Math.max(2, count(r) / max * 100) + "%"; return h("div", { class: "barrow" }, h("span", { class: "mono" }, label(r)), h("div", { class: "bartrack" }, f), h("span", {}, count(r))); }); };
+const rangeSeg = (opts, cur, on) => h("div", { class: "seg", role: "group" }, opts.map(r => h("button", { class: cur === r ? "on" : "", "aria-pressed": String(cur === r), onclick: () => on(r) }, r)));
+const sortable = (cols, key, onsort) => h("tr", {}, cols.map(([k, label]) => h("th", { class: k ? "sortable" : "", tabindex: k ? "0" : null, "aria-sort": S[key].k === k ? (S[key].dir > 0 ? "ascending" : "descending") : null,
+  onclick: k ? () => onsort(k) : null, onkeydown: k ? e => { if (e.key === "Enter") onsort(k); } : null }, label, S[key].k === k ? (S[key].dir > 0 ? " ▲" : " ▼") : "")));
+
+/* stacked bars (alerts per bucket by severity) with the same axes/hover as the line charts */
+function stackedBars(title, t, series, since, until, bucket, unit) {
+  const W = 900, H = 170, L = 40, R = 10, T = 10, B = 24, box = h("div", { class: "chart" });
+  const totals = t.map((_, i) => series.reduce((n, s) => n + s.vals[i], 0)), sum = totals.reduce((a, b) => a + b, 0);
+  box.append(h("div", { class: "ctitle" }, h("span", {}, title), h("span", { class: "legend" }, series.map(s => h("span", {}, h("i", { class: "sw " + s.cls }), s.name)), h("span", { class: "dim" }, sum + " total"))));
+  if (!sum) { box.append(h("div", { class: "note" }, "No alerts in this period ✔")); return box; }
+  const span = Math.max(until - since, 1), ymax = niceMax(Math.max(...totals)), X = ts => L + (ts - since) / span * (W - L - R), Y = v => T + (1 - v / ymax) * (H - T - B);
+  const bw = Math.max(3, bucket / span * (W - L - R) - 3), svgEl = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": title });
+  for (let i = 0; i <= 4; i++) { const v = ymax * i / 4, y = Y(v); svgEl.append(svg("line", { x1: L, x2: W - R, y1: y, y2: y, class: "grid" })); const tx = svg("text", { x: L - 6, y: y + 4, "text-anchor": "end", class: "axis" }); tx.textContent = Number.isInteger(v) ? v : v.toFixed(1); svgEl.append(tx); }
+  for (let i = 0; i <= 5; i++) { const ts = since + span * i / 5, tx = svg("text", { x: X(ts), y: H - 6, "text-anchor": i === 0 ? "start" : i === 5 ? "end" : "middle", class: "axis" }); tx.textContent = fmtTick(ts, span); svgEl.append(tx); }
+  t.forEach((ts, i) => { let acc = 0; for (const s of series) { const v = s.vals[i]; if (!v) continue; const y1 = Y(acc + v), y0 = Y(acc); svgEl.append(svg("rect", { x: X(ts) + 1, y: y1, width: bw, height: Math.max(1, y0 - y1), class: s.cls })); acc += v; } });
+  const tip = h("div", { class: "tip", hidden: true });
+  svgEl.addEventListener("mousemove", ev => {
+    const r = svgEl.getBoundingClientRect(), ts = since + ((ev.clientX - r.left) / r.width * W - L) / (W - L - R) * span;
+    let best = -1; t.forEach((x, i) => { if (ts >= x && ts < x + bucket) best = i; });
+    if (best < 0) { tip.hidden = true; return; }
+    tip.hidden = false; tip.textContent = new Date(t[best] * 1000).toLocaleString() + "  ·  " + series.map(s => s.name + " " + s.vals[best]).join(", ");
+    tip.style.left = Math.min(Math.max(X(t[best]) / W * r.width - 10, 0), r.width - 330) + "px";
+  });
+  svgEl.addEventListener("mouseleave", () => { tip.hidden = true; });
+  box.append(svgEl, tip); return box;
+}
+
+/* ---------- overview ---------- */
+function overviewView() {
+  const ov = S.ov, kids = [h("div", { class: "title" }, h("h2", {}, S.tag ? "Overview (fleet-wide)" : "Overview"), h("div", { class: "grow" }), rangeSeg(["24h", "7d"], S.ovRange, r => { S.ovRange = r; S.ov = null; refresh(); })), riskView()];
+  if (!ov) return [...kids, h("div", { class: "empty" }, "Loading…")];
+  kids.push(stackedBars("Alerts over time", ov.alerts.t, [{ name: "High", cls: "b-high", vals: ov.alerts.high }, { name: "Medium", cls: "b-medium", vals: ov.alerts.medium }, { name: "Info", cls: "b-info", vals: ov.alerts.info }], ov.since, ov.until, ov.bucket));
+  kids.push(h("div", { class: "twocol" },
+    lineChart("Established connections, whole fleet", "c-accent", ov.fleet.t, ov.fleet.established, ov.fleet.since, ov.until, "connections"),
+    lineChart("Half-open (SYN_RECV), whole fleet: a flood shows up here", "c-bad", ov.fleet.t, ov.fleet.syn_recv, ov.fleet.since, ov.until, "half-open")));
+  const ex = ov.exposure;
+  kids.push(h("div", { class: "riskgrid" },
+    h("div", { class: "rpanel" }, h("h4", {}, "Busiest hosts, " + S.ovRange), ov.top_hosts.length ? ov.top_hosts.map(x => h("div", { class: "ritem", tabindex: "0", role: "button", onclick: () => go("hosts", x.id), onkeydown: e => { if (e.key === "Enter") go("hosts", x.id); } },
+      h("b", {}, x.count + "×"), h("div", { class: "grow" }, x.name, x.high ? h("span", { class: "dim" }, "  " + x.high + " high") : null))) : h("div", { class: "dim" }, "No alerts in this period.")),
+    h("div", { class: "rpanel" }, h("h4", {}, "Attack surface"),
+      h("div", { class: "kvgrid" }, h("div", {}, h("div", { class: "v" }, ex.exposed), h("div", { class: "dim" }, "listeners reachable from the network")),
+        h("div", {}, h("div", { class: "v " + (ex.risky ? "bad" : "") }, ex.risky), h("div", { class: "dim" }, "risky services exposed")),
+        h("div", {}, h("div", { class: "v" }, ex.new24h), h("div", { class: "dim" }, "opened in the last 24 h"))),
+      h("button", { onclick: () => go("exposure") }, "Review exposure →")),
+    h("div", { class: "rpanel" }, h("h4", {}, "Where to look next"),
+      h("div", { class: "ritem", tabindex: "0", role: "button", onclick: () => go("threats") }, h("div", { class: "grow" }, "Threat sources", h("div", { class: "dim" }, "who is hitting you, and what to block"))),
+      h("div", { class: "ritem", tabindex: "0", role: "button", onclick: () => go("traffic") }, h("div", { class: "grow" }, "Traffic", h("div", { class: "dim" }, "top talkers, most-hit ports, busiest processes"))),
+      h("div", { class: "ritem", tabindex: "0", role: "button", onclick: () => go("alerts") }, h("div", { class: "grow" }, "Alerts", h("div", { class: "dim" }, "filter, assign, comment, export"))))));
+  return kids;
+}
+
+/* ---------- alerts page ---------- */
+function alertsPage() {
+  return [h("div", { class: "title" }, h("h2", {}, "Alerts" + (S.tag ? " · hosts tagged " + S.tag : ""))), alertsBar(), alertsTable(true)];
+}
+
+/* ---------- hosts page ---------- */
+function hostsPage() {
+  const q = S.filter.toLowerCase(), { k, dir } = S.hSort;
+  const key = { status: x => ({ down: 0, pending: 1, up: 2 }[x.status] ?? 3), name: x => x.name.toLowerCase(), addr: x => x.addr, os: x => x.os, version: x => x.version, listeners: x => x.listeners, established: x => x.established, syn_recv: x => x.syn_recv, open_alerts: x => x.open_alerts, last_seen: x => x.last_seen }[k] || (x => x.name);
+  const rows = S.hosts.filter(x => (!S.tag || x.tags.includes(S.tag)) && (!q || [x.name, x.addr, x.os, x.tags.join(" "), x.status].some(v => String(v).toLowerCase().includes(q)))).sort((a, b) => { const A = key(a), B = key(b); return (A < B ? -1 : A > B ? 1 : 0) * dir; });
+  const search = h("input", { type: "search", id: "filter", placeholder: "Filter hosts…", value: S.filter, "aria-label": "Filter hosts", oninput: e => { S.filter = e.target.value; const p = e.target.selectionStart; render(); const n = document.getElementById("filter"); n.focus(); n.setSelectionRange(p, p); } });
+  const onsort = c => { S.hSort = { k: c, dir: S.hSort.k === c ? -S.hSort.dir : 1 }; render(); };
+  return [h("div", { class: "title" }, h("h2", {}, "Hosts"), h("span", { class: "dim" }, rows.length + " of " + S.hosts.length)), h("div", { class: "bar" }, search),
+    tbl(h("thead", {}, sortable([["status", "Status"], ["name", "Host"], ["addr", "Address"], ["os", "OS"], ["version", "Agent"], ["listeners", "Listening"], ["established", "Established"], ["syn_recv", "SYN_RECV"], ["open_alerts", "Alerts"], ["", "Tags"], ["last_seen", "Last seen"]], "hSort", onsort)),
+      h("tbody", {}, rows.map(x => h("tr", { class: "click", tabindex: "0", onclick: () => go("hosts", x.id), onkeydown: e => { if (e.key === "Enter") go("hosts", x.id); } },
+        h("td", {}, dot(x.status), " ", x.status), h("td", {}, x.name), h("td", { class: "mono" }, x.addr), h("td", {}, x.os), h("td", {}, x.version), h("td", {}, x.listeners), h("td", {}, x.established),
+        h("td", { class: x.syn_recv > 10 ? "ext" : "" }, x.syn_recv), h("td", {}, x.open_alerts ? h("span", { class: "badge" }, x.open_alerts) : 0), h("td", {}, x.tags.map(t => pill(t))), h("td", { title: when(x.last_seen) }, ago(x.last_seen))))))];
+}
+
+/* ---------- threat sources ---------- */
+function threatsView() {
+  if (S.source) return sourceDetail();
+  const rows = S.threats;
+  const head = [h("div", { class: "title" }, h("h2", {}, "Threat sources"), h("div", { class: "grow" }), rangeSeg(["1h", "24h", "7d", "30d"], S.tRange, r => { S.tRange = r; S.threats = null; refresh(); })),
+    h("div", { class: "note" }, "Addresses named in alerts: port scans, brute force, connection floods. Ranked by high-severity alerts. Click one to investigate and get containment commands.")];
+  if (!rows) return [...head, h("div", { class: "empty" }, "Loading…")];
+  if (!rows.length) return [...head, h("div", { class: "empty" }, "No attributed attacker activity in this period ✔")];
+  return [...head, tbl(h("thead", {}, h("tr", {}, ["Source", "Scope", "High", "Alerts", "Types", "Hosts hit", "Live conns", "First seen", "Last seen"].map(t => h("th", {}, t)))),
+    h("tbody", {}, rows.map(x => h("tr", { class: "click", tabindex: "0", onclick: () => goSource(x.ip), onkeydown: e => { if (e.key === "Enter") goSource(x.ip); } },
+      h("td", { class: "mono" }, x.ip), h("td", {}, intTag(x.internal)), h("td", {}, x.high ? h("span", { class: "sev HIGH" }, x.high) : 0), h("td", {}, x.count), h("td", {}, kindTags(x.kinds)), h("td", {}, x.hosts),
+      h("td", {}, x.connections_now || 0), h("td", { title: when(x.first) }, ago(x.first)), h("td", { title: when(x.last) }, ago(x.last))))))];
+}
+function sourceDetail() {
+  const d = S.srcData, back = h("button", { onclick: () => { S.source = null; S.srcData = null; refresh(); } }, "← All sources");
+  if (!d || d.ip !== S.source) return [h("div", { class: "title" }, back, h("h2", { class: "mono" }, S.source)), h("div", { class: "empty" }, "Loading…")];
+  const hostsHit = Object.entries(d.hosts), high = d.alerts.filter(a => a.severity === "HIGH").length, first = d.alerts.length ? Math.min(...d.alerts.map(a => a.ts)) : 0, v6 = d.ip.includes(":");
+  const cmds = d.internal ? null : [["ufw", `sudo ufw deny from ${d.ip}`], ["iptables", `sudo ${v6 ? "ip6tables" : "iptables"} -I INPUT -s ${d.ip} -j DROP`], ["nftables", `sudo nft add rule inet filter input ${v6 ? "ip6" : "ip"} saddr ${d.ip} drop`]];
+  return [h("div", { class: "title" }, back, h("h2", { class: "mono" }, d.ip), intTag(d.internal)),
+    h("div", { class: "cards" }, card("Alerts", d.alerts.length), card("High severity", high, high > 0), card("Hosts targeted", hostsHit.length), card("Connections now", d.conns_total, d.conns_total > 0), card("First seen", first ? ago(first) : "–")),
+    h("div", { class: "riskgrid" },
+      h("div", { class: "rpanel" }, h("h4", {}, "What it did"), Object.entries(d.kinds).sort((a, b) => b[1] - a[1]).map(([k, n]) => h("div", { class: "barrow" }, h("span", { class: "mono" }, k), h("div", { class: "bartrack" }, (() => { const f = h("div", { class: "barfill" }); f.style.width = Math.max(4, n / Math.max(...Object.values(d.kinds)) * 100) + "%"; return f; })()), h("span", {}, n)))),
+      h("div", { class: "rpanel" }, h("h4", {}, "Hosts it touched"), hostsHit.length ? hostsHit.sort((a, b) => b[1] - a[1]).map(([n, c]) => h("div", { class: "ritem" }, h("b", {}, c + "×"), h("div", { class: "grow" }, n))) : h("div", { class: "dim" }, "–")),
+      h("div", { class: "rpanel" }, h("h4", {}, "Containment"),
+        cmds ? [h("div", { class: "note" }, "Run on the affected host(s) as root. netwatch is read-only and never changes your firewall itself."), ...cmds.map(([n, c]) => h("div", { class: "cmd" }, h("span", { class: "dim" }, n), h("code", {}, c), copyBtn(c)))]
+          : h("div", { class: "dim" }, "This is an internal address (private/loopback/link-local): do not block it blindly. It may be a scanner you own, a misconfigured service, or a compromised machine on your network. Check your asset inventory first."))),
+    h("h4", {}, "Alerts from this source"), alertsTable(true, d.alerts),
+    h("h4", {}, "Current connections from this source (" + (d.conns_total > d.conns.length ? "showing " + d.conns.length + " of " + d.conns_total : d.conns_total) + ")"),
+    d.conns.length ? tbl(h("thead", {}, h("tr", {}, ["Host", "Proto", "State", "Local", "Remote", "Process"].map(t => h("th", {}, t)))),
+      h("tbody", {}, d.conns.map(c => h("tr", { class: "click", tabindex: "0", onclick: () => go("hosts", c.host_id, "conns") }, h("td", {}, c.host), h("td", {}, c.proto), h("td", { class: "st-" + c.state }, c.state), h("td", { class: "mono" }, c.local), h("td", { class: "mono" }, c.remote), h("td", {}, c.process))))) : h("div", { class: "dim" }, "None right now.")];
+}
+
+/* ---------- exposure ---------- */
+function exposureView() {
+  const d = S.exposure; if (!d) return [h("div", { class: "title" }, h("h2", {}, "Exposure")), h("div", { class: "empty" }, "Loading…")];
+  const q = S.filter.toLowerCase(), sm = d.summary;
+  const riskBadge = r => h("span", { class: "sev " + ["INFO", "MEDIUM", "HIGH"][r] }, ["OK", "REVIEW", "RISKY"][r]);
+  const groups = d.groups.filter(g => (!S.expOnly || g.exposed_hosts > 0) && (!S.expRisky || g.risk === 2) && (!q || [g.port, g.service, g.why, g.proto, ...g.hosts.flatMap(x => [x.host, x.process, x.addr])].some(v => String(v ?? "").toLowerCase().includes(q))));
+  const search = h("input", { type: "search", id: "filter", placeholder: "Filter port, service, host, process…", value: S.filter, "aria-label": "Filter", oninput: e => { S.filter = e.target.value; const p = e.target.selectionStart; render(); const n = document.getElementById("filter"); n.focus(); n.setSelectionRange(p, p); } });
+  const rows = [];
+  for (const g of groups) {
+    const key = g.proto + g.port, open = !!S.expanded[key], toggle = () => { S.expanded[key] = !open; render(); };
+    rows.push(h("tr", { class: "click", tabindex: "0", "aria-expanded": String(open), onclick: toggle, onkeydown: e => { if (e.key === "Enter") toggle(); } },
+      h("td", {}, riskBadge(g.risk)), h("td", { class: "mono" }, (open ? "▾ " : "▸ ") + g.port + "/" + g.proto), h("td", {}, g.service || h("span", { class: "dim" }, "unknown")),
+      h("td", {}, g.exposed_hosts + " / " + g.hosts.length), h("td", {}, g.why || "")));
+    if (open) for (const x of g.hosts) rows.push(h("tr", { class: "subrow click", tabindex: "0", onclick: () => go("hosts", x.host_id, "ports") },
+      h("td", {}), h("td", {}, "↳ ", x.host), h("td", { class: "mono" }, x.addr + " "), h("td", {}, x.scope === "loopback" ? pill("this machine only") : x.scope === "any" ? pill("all interfaces", "warnpill") : pill(x.internal_addr ? "LAN address" : "specific address", "warnpill"), x.new ? pill("new", "warnpill") : null),
+      h("td", {}, x.process + (x.user ? " · " + x.user : "") + " · open " + ago(x.first_seen))));
+  }
+  return [h("div", { class: "title" }, h("h2", {}, "Exposure"), h("div", { class: "note" }, "Everything listening, across the fleet, grouped by port.")),
+    h("div", { class: "cards" }, card("Listeners", sm.listeners), card("Reachable from the network", sm.exposed), card("Risky services exposed", sm.risky, sm.risky > 0), card("Opened in the last 24 h", sm.new24h)),
+    h("div", { class: "bar" }, search, h("label", {}, h("input", { type: "checkbox", checked: S.expOnly, onchange: e => { S.expOnly = e.target.checked; render(); } }), "only network-reachable"),
+      h("label", {}, h("input", { type: "checkbox", checked: S.expRisky, onchange: e => { S.expRisky = e.target.checked; render(); } }), "only risky"), h("div", { class: "grow" }),
+      h("button", { onclick: () => { d.groups.forEach(g => { S.expanded[g.proto + g.port] = true; }); render(); } }, "Expand all"), h("button", { onclick: () => { S.expanded = {}; render(); } }, "Collapse")),
+    groups.length ? tbl(h("thead", {}, h("tr", {}, ["Risk", "Port", "Service", "Exposed on", "Why it matters / process"].map(t => h("th", {}, t)))), h("tbody", {}, rows)) : h("div", { class: "empty" }, "Nothing matches. ✔"),
+    h("div", { class: "note" }, "“Risky” means a service that is normally dangerous to expose (databases, remote desktop, clear-text protocols) and is bound to a non-loopback address. It is a heuristic: a firewall in front may already protect it.")];
+}
+
+/* ---------- traffic ---------- */
+function trafficView() {
+  const t = S.traffic; if (!t) return [h("div", { class: "title" }, h("h2", {}, "Traffic")), h("div", { class: "empty" }, "Loading…")];
+  const peerTable = (rows, inbound) => rows.length ? tbl(h("thead", {}, h("tr", {}, [inbound ? "Source" : "Destination", "Conns", inbound ? "Ports hit" : "Ports", "Hosts"].map(x => h("th", {}, x)))),
+    h("tbody", {}, rows.map(r => h("tr", { class: inbound ? "click" : "", tabindex: inbound ? "0" : null, onclick: inbound ? () => goSource(r.ip) : null, onkeydown: inbound ? e => { if (e.key === "Enter") goSource(r.ip); } : null },
+      h("td", { class: "mono" }, r.ip, " ", intTag(r.internal)), h("td", {}, r.count), h("td", {}, r.port_count > 8 ? r.ports.join(", ") + " … (" + r.port_count + ")" : r.ports.join(", ")), h("td", {}, r.hosts.join(", ")))))) : h("div", { class: "dim" }, "None.");
+  const spread = t.top_inbound.filter(r => r.port_count >= 5).length;
+  return [h("div", { class: "title" }, h("h2", {}, "Traffic"), h("div", { class: "note" }, "Live view of current connections from the latest agent reports (up to 2000 per host). History and alerts live on the other pages.")),
+    h("div", { class: "cards" }, card("Connections", t.total), card("Distinct inbound sources", t.top_inbound.length), card("Sources touching ≥ 5 ports", spread, spread > 0), card("SYN_RECV", (t.states.find(s => s.state === "SYN_RECV") || { count: 0 }).count, (t.states.find(s => s.state === "SYN_RECV") || { count: 0 }).count > 10)),
+    h("div", { class: "riskgrid" },
+      h("div", { class: "rpanel wide" }, h("h4", {}, "Top inbound sources"), peerTable(t.top_inbound, true)),
+      h("div", { class: "rpanel wide" }, h("h4", {}, "Top outbound destinations"), peerTable(t.top_outbound, false))),
+    h("div", { class: "riskgrid" },
+      h("div", { class: "rpanel" }, h("h4", {}, "Most-hit local ports"), t.inbound_ports.length ? barList(t.inbound_ports, r => r.port + (r.service ? " " + r.service : ""), r => r.count) : h("div", { class: "dim" }, "None.")),
+      h("div", { class: "rpanel" }, h("h4", {}, "Busiest processes"), t.processes.length ? barList(t.processes, r => r.process, r => r.count) : h("div", { class: "dim" }, "Process names need an agent running as root.")),
+      h("div", { class: "rpanel" }, h("h4", {}, "Connection states"), barList(t.states, r => r.state, r => r.count, r => r.state === "SYN_RECV" ? "bad" : ""))),
+    h("h4", {}, "Load per host"), tbl(h("thead", {}, h("tr", {}, ["Host", "Inbound", "Outbound"].map(x => h("th", {}, x)))), h("tbody", {}, t.hosts.map(x => h("tr", {}, h("td", {}, x.host), h("td", {}, x.inbound), h("td", {}, x.outbound)))))];
+}
+
+/* ---------- system health ---------- */
+function healthView() {
+  const d = S.health; if (!d) return [h("div", { class: "title" }, h("h2", {}, "System health")), h("div", { class: "empty" }, "Loading…")];
+  const checks = [], add = (level, text) => checks.push({ level, text });
+  const skew = d.agents.filter(a => !a.version_ok), noroot = d.agents.filter(a => !a.is_root && a.status !== "pending"), expiring = d.agents.filter(a => a.cert_days < 90), down = d.agents.filter(a => a.status === "down");
+  down.length ? add("bad", down.length + " agent(s) not reporting: " + down.map(a => a.name).join(", ")) : add("ok", "All agents are reporting");
+  skew.length ? add("warn", skew.length + " agent(s) run a different version than the server (" + d.server.version + "): " + skew.map(a => a.name + " " + a.version).join(", ")) : add("ok", "Agents match the server version");
+  noroot.length ? add("warn", noroot.length + " agent(s) run without root, so process names are missing for other users' sockets") : add("ok", "All agents run with full visibility");
+  expiring.length ? add("bad", expiring.length + " agent certificate(s) expire within 90 days: re-enroll with `netwatch agent enroll --force`") : add("ok", "No agent certificates expiring soon");
+  d.webhook.configured ? add("ok", "Webhook alerts go to " + d.webhook.target + " (" + d.webhook.format + ", " + d.webhook.min_severity + "+)") : add("info", "No webhook configured: alerts are only visible here (netwatch server set webhook_url …)");
+  d.users.admin > d.users.with_2fa ? add("warn", "Not every admin has two-factor login enabled (netwatch server user totp <name>)") : add("ok", "Two-factor is enabled for all admins");
+  d.users.must_change ? add("info", d.users.must_change + " account(s) still must change their password") : null;
+  d.server.tls ? add("ok", "Dashboard is served over HTTPS") : add("info", "Dashboard is plain HTTP (fine on loopback behind an SSH tunnel; use --tls or a proxy otherwise)");
+  add(d.metrics_endpoint ? "ok" : "info", d.metrics_endpoint ? "Prometheus metrics endpoint is enabled" : "Prometheus endpoint is off (netwatch server metrics-token)");
+  const icon = { ok: "✔", warn: "!", bad: "✖", info: "i" };
+  return [h("div", { class: "title" }, h("h2", {}, "System health")),
+    h("div", { class: "cards" }, card("Server version", d.server.version), card("Dashboard uptime", fmtDur(d.server.now - d.server.started)), card("Database size", fmtBytes(d.server.db_bytes)), card("Active maintenance", d.mutes_active)),
+    h("div", { class: "rpanel wide" }, h("h4", {}, "Checks"), checks.map(c => h("div", { class: "check " + c.level }, h("span", { class: "ck", "aria-hidden": "true" }, icon[c.level]), h("span", { class: "sr" }, c.level + ": "), c.text))),
+    h("div", { class: "riskgrid" },
+      h("div", { class: "rpanel" }, h("h4", {}, "Accounts"), [["Admins", d.users.admin], ["Operators", d.users.operator], ["Viewers", d.users.viewer], ["Disabled", d.users.disabled], ["With two-factor", d.users.with_2fa]].map(([k, v]) => h("div", { class: "kv2" }, h("span", {}, k), h("b", {}, v)))),
+      h("div", { class: "rpanel" }, h("h4", {}, "Stored data (retention: metrics " + d.retention.metrics_days + " d, alerts & audit " + d.retention.alerts_days + " d)"), d.tables.map(x => h("div", { class: "kv2" }, h("span", { class: "mono" }, x.table), h("b", {}, x.rows.toLocaleString())))),
+      h("div", { class: "rpanel" }, h("h4", {}, "Settings"), [["Agent report interval", (d.server.report_interval || "10") + " s"], ["Host considered down after", (d.server.down_after || "90") + " s"]].map(([k, v]) => h("div", { class: "kv2" }, h("span", {}, k), h("b", {}, v))))),
+    h("h4", {}, "Agents"), tbl(h("thead", {}, h("tr", {}, ["Host", "Status", "Version", "OS", "Root", "Last seen", "Cert expires in"].map(x => h("th", {}, x)))),
+      h("tbody", {}, d.agents.map(a => h("tr", { class: "click", tabindex: "0", onclick: () => go("hosts", a.id), onkeydown: e => { if (e.key === "Enter") go("hosts", a.id); } },
+        h("td", {}, a.name), h("td", {}, dot(a.status), " ", a.status), h("td", { class: a.version_ok ? "" : "ext" }, a.version), h("td", {}, a.os), h("td", {}, a.is_root ? "yes" : "no"), h("td", { title: when(a.last_seen) }, ago(a.last_seen)),
+        h("td", { class: a.cert_days < 90 ? "ext" : "" }, a.cert_days < 0 ? "expired" : fmtDur(a.cert_days * 86400))))))];
+}
+
 /* ---------- boot ---------- */
 function start() {
-  clearInterval(S.timer); S.me = null; S.view = "hosts";
+  clearInterval(S.timer); S.me = null; S.view = "overview";
   refresh();
   S.timer = setInterval(() => {
     const id = document.activeElement?.id;

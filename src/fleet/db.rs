@@ -372,6 +372,7 @@ pub struct AlertFilter<'a> {
     pub severity: Option<&'a str>,
     pub kind: Option<&'a str>,
     pub assignee: Option<&'a str>,
+    pub source: Option<&'a str>,
     pub limit: usize,
 }
 
@@ -391,10 +392,11 @@ pub fn alerts_filtered(c: &Connection, f: &AlertFilter) -> Res<Vec<AlertRow>> {
            AND (?2 IS NULL OR (',' || COALESCE(h.tags,'') || ',') LIKE '%,' || ?2 || ',%')
            AND (?3 = 1 OR a.acked = 0) AND a.ts >= ?4
            AND (?5 IS NULL OR a.severity = ?5) AND (?6 IS NULL OR a.kind = ?6) AND (?7 IS NULL OR a.assignee = ?7)
+           AND (?9 IS NULL OR a.source = ?9)
          ORDER BY a.ts DESC, a.id DESC LIMIT ?8"
     ))?;
     let rows = st.query_map(
-        params![f.host, f.tag, f.include_acked as i64, f.since as i64, f.severity, f.kind, f.assignee, f.limit.max(1) as i64],
+        params![f.host, f.tag, f.include_acked as i64, f.since as i64, f.severity, f.kind, f.assignee, f.limit.max(1) as i64, f.source],
         alert_row,
     )?;
     rows.collect()
@@ -853,4 +855,125 @@ pub fn risk(c: &Connection) -> Res<Risk> {
     let unacked_high: u32 = c.query_row("SELECT COUNT(*) FROM alerts WHERE severity = 'HIGH' AND acked = 0 AND muted = 0", [], |r| r.get(0))?;
     let active_mutes = mutes(c)?.iter().filter(|m| m.active).count() as u32;
     Ok(Risk { exposed, sources, kinds, unacked_high, active_mutes })
+}
+
+
+// ---------- insight queries ----------
+
+/// Alerts per time bucket and severity (muted alerts excluded): (bucket start, high, medium, info).
+pub fn alert_trend(c: &Connection, since: u64, bucket: u64) -> Res<Vec<(u64, u32, u32, u32)>> {
+    let mut st = c.prepare(
+        "SELECT (ts / ?2) * ?2, SUM(severity = 'HIGH'), SUM(severity = 'MEDIUM'), SUM(severity = 'INFO') FROM alerts
+         WHERE ts >= ?1 AND muted = 0 GROUP BY 1 ORDER BY 1",
+    )?;
+    let rows = st.query_map(params![since as i64, bucket.max(1) as i64], |r| {
+        Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u32, r.get::<_, i64>(2)? as u32, r.get::<_, i64>(3)? as u32))
+    })?;
+    rows.collect()
+}
+
+/// Fleet-wide totals per bucket: the sum over hosts of each host's maximum in that bucket.
+/// (bucket start, established, syn_recv, listeners)
+pub fn fleet_series(c: &Connection, since: u64, bucket: u64) -> Res<Vec<(u64, u32, u32, u32)>> {
+    let mut st = c.prepare(
+        "SELECT b, SUM(e), SUM(s), SUM(l) FROM (
+           SELECT host_id, (ts / ?2) * ?2 AS b, MAX(established) e, MAX(syn_recv) s, MAX(listeners) l
+           FROM metrics WHERE ts >= ?1 GROUP BY host_id, b) GROUP BY b ORDER BY b",
+    )?;
+    let rows = st.query_map(params![since as i64, bucket.max(1) as i64], |r| {
+        Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u32, r.get::<_, i64>(2)? as u32, r.get::<_, i64>(3)? as u32))
+    })?;
+    rows.collect()
+}
+
+/// (host id, host name, alerts, high alerts) busiest first.
+pub fn top_hosts_by_alerts(c: &Connection, since: u64, limit: usize) -> Res<Vec<(String, String, u32, u32)>> {
+    let mut st = c.prepare(
+        "SELECT a.host_id, COALESCE(h.name, a.host_id), COUNT(*), SUM(a.severity = 'HIGH') FROM alerts a
+         LEFT JOIN hosts h ON h.id = a.host_id WHERE a.ts >= ?1 AND a.muted = 0
+         GROUP BY a.host_id ORDER BY COUNT(*) DESC LIMIT ?2",
+    )?;
+    let rows = st.query_map(params![since as i64, limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u32, r.get::<_, i64>(3)? as u32)))?;
+    rows.collect()
+}
+
+pub fn all_listeners(c: &Connection) -> Res<Vec<super::insights::Listener>> {
+    let mut st = c.prepare(
+        "SELECT l.host_id, COALESCE(h.name, l.host_id), l.proto, l.addr, l.port, COALESCE(l.process,'-'), COALESCE(l.user,''), l.first_seen
+         FROM listeners l JOIN hosts h ON h.id = l.host_id WHERE h.revoked = 0",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok(super::insights::Listener { host_id: r.get(0)?, host: r.get(1)?, proto: r.get(2)?, addr: r.get(3)?, port: r.get(4)?, process: r.get(5)?, user: r.get(6)?, first_seen: r.get::<_, i64>(7)? as u64 })
+    })?;
+    rows.collect()
+}
+
+pub fn all_conns(c: &Connection) -> Res<Vec<super::insights::ConnRow>> {
+    let mut st = c.prepare(
+        "SELECT n.host_id, COALESCE(h.name, n.host_id), n.proto, n.state, n.local, n.remote, COALESCE(n.process,'-') FROM conns n
+         JOIN hosts h ON h.id = n.host_id WHERE h.revoked = 0 LIMIT 60000",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok(super::insights::ConnRow { host_id: r.get(0)?, host: r.get(1)?, proto: r.get(2)?, state: r.get(3)?, local: r.get(4)?, remote: r.get(5)?, process: r.get(6)? })
+    })?;
+    rows.collect()
+}
+
+pub struct ThreatRow {
+    pub ip: String,
+    pub count: u32,
+    pub high: u32,
+    pub kinds: Vec<String>,
+    pub hosts: u32,
+    pub first: u64,
+    pub last: u64,
+}
+
+/// Sources named in alerts since `since`, most active first (muted alerts excluded).
+pub fn threats(c: &Connection, since: u64) -> Res<Vec<ThreatRow>> {
+    let mut st = c.prepare(
+        "SELECT source, COUNT(*), SUM(severity = 'HIGH'), GROUP_CONCAT(DISTINCT kind), COUNT(DISTINCT host_id), MIN(ts), MAX(ts) FROM alerts
+         WHERE ts >= ?1 AND source IS NOT NULL AND muted = 0 GROUP BY source ORDER BY SUM(severity = 'HIGH') DESC, COUNT(*) DESC, MAX(ts) DESC LIMIT 100",
+    )?;
+    let rows = st.query_map([since as i64], |r| {
+        let kinds: String = r.get(3)?;
+        Ok(ThreatRow {
+            ip: r.get(0)?, count: r.get::<_, i64>(1)? as u32, high: r.get::<_, i64>(2)? as u32,
+            kinds: kinds.split(',').map(String::from).collect(), hosts: r.get::<_, i64>(4)? as u32,
+            first: r.get::<_, i64>(5)? as u64, last: r.get::<_, i64>(6)? as u64,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Current connections whose remote end is `ip` (caller must have validated it as an IP literal).
+pub fn conns_from_ip(c: &Connection, ip: &str) -> Res<Vec<super::insights::ConnRow>> {
+    let mut st = c.prepare(
+        "SELECT n.host_id, COALESCE(h.name, n.host_id), n.proto, n.state, n.local, n.remote, COALESCE(n.process,'-') FROM conns n
+         JOIN hosts h ON h.id = n.host_id WHERE h.revoked = 0 AND n.remote LIKE ?1 LIMIT 200",
+    )?;
+    let rows = st.query_map([format!("{ip}:%")], |r| {
+        Ok(super::insights::ConnRow { host_id: r.get(0)?, host: r.get(1)?, proto: r.get(2)?, state: r.get(3)?, local: r.get(4)?, remote: r.get(5)?, process: r.get(6)? })
+    })?;
+    rows.collect()
+}
+
+pub fn count_conns_from_ip(c: &Connection, ip: &str) -> Res<i64> {
+    c.query_row(
+        "SELECT COUNT(*) FROM conns n JOIN hosts h ON h.id = n.host_id WHERE h.revoked = 0 AND n.remote LIKE ?1",
+        [format!("{ip}:%")],
+        |r| r.get(0),
+    )
+}
+
+pub fn earliest_metric(c: &Connection) -> Res<Option<u64>> {
+    Ok(c.query_row("SELECT MIN(ts) FROM metrics", [], |r| r.get::<_, Option<i64>>(0))?.map(|v| v as u64))
+}
+
+pub fn table_counts(c: &Connection) -> Res<Vec<(&'static str, i64)>> {
+    let mut out = Vec::new();
+    for t in ["alerts", "metrics", "audit", "listener_events", "alert_comments"] {
+        out.push((t, c.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))?));
+    }
+    Ok(out)
 }

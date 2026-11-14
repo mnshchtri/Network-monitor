@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod auth;
 pub mod db;
+pub mod insights;
 pub mod pki;
 pub mod proto;
 pub mod server;

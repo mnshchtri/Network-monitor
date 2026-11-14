@@ -9,6 +9,7 @@
 
 use super::auth::{self, role_rank};
 use super::db::{self, User};
+use super::insights;
 use super::pki;
 use super::server::default_server_dir;
 use super::util::*;
@@ -62,6 +63,7 @@ struct State {
     sessions: Mutex<HashMap<String, Session>>,
     fails: Mutex<Fails>,
     active: AtomicUsize,
+    started: u64,
 }
 
 fn sid(token: &str) -> String {
@@ -300,9 +302,14 @@ fn parse_filter<'a>(req: &'a Req, me: &'a User) -> Result<db::AlertFilter<'a>, &
         Some(_) => return Err("bad assignee"),
         None => None,
     };
+    let source = q("source");
+    if source.map_or(false, |v| !insights::valid_ip(v)) {
+        return Err("bad source");
+    }
     Ok(db::AlertFilter {
         host,
         tag,
+        source,
         include_acked: q("all") == Some("1"),
         since: q("since").and_then(|v| v.parse().ok()).unwrap_or(0),
         severity,
@@ -571,7 +578,10 @@ fn route(st: &State, c: &rusqlite::Connection, req: &Req, s: &mut impl Write, a:
         ("GET", "/api/summary") => {
             let hosts = db::hosts(c)?;
             let open: u32 = hosts.iter().map(|h| h.open_alerts).sum();
-            json_resp(s, 200, json!({"hosts": hosts.iter().map(host_json).collect::<Vec<_>>(), "open_alerts": open, "now": now_secs()}));
+            let (_, ex) = insights::exposure(&db::all_listeners(c)?, now_secs());
+            let sources = db::threats(c, now_secs().saturating_sub(86400))?.len();
+            json_resp(s, 200, json!({"hosts": hosts.iter().map(host_json).collect::<Vec<_>>(), "open_alerts": open, "now": now_secs(),
+                                     "risky_exposed": ex["risky"], "threat_sources": sources}));
         }
         ("GET", "/api/alerts") => {
             let f = match parse_filter(req, me) {
@@ -665,6 +675,106 @@ fn route(st: &State, c: &rusqlite::Connection, req: &Req, s: &mut impl Write, a:
                 "kinds": r.kinds.iter().map(|(k, n)| json!({"kind": k, "count": n})).collect::<Vec<_>>(),
                 "unacked_high": r.unacked_high,
                 "mutes_active": r.active_mutes,
+            }));
+        }
+        ("GET", "/api/insights/overview") => {
+            let secs: u64 = if req.query.get("range").map(String::as_str) == Some("7d") { 7 * 86400 } else { 86400 };
+            let bucket = if secs > 86400 { 6 * 3600 } else { 3600 };
+            let since = now_secs().saturating_sub(secs) / bucket * bucket;
+            let tr = db::alert_trend(c, since, bucket)?;
+            // Fleet trend buckets adapt to how much history exists, so a young install still gets a curve.
+            let now = now_secs();
+            let fsince = db::earliest_metric(c)?.map_or(now.saturating_sub(secs), |e| e.max(now.saturating_sub(secs)));
+            let fbucket = (now.saturating_sub(fsince).max(60) / 100).max(10);
+            let fl = db::fleet_series(c, fsince / fbucket * fbucket, fbucket)?;
+            let (_, ex) = insights::exposure(&db::all_listeners(c)?, now_secs());
+            json_resp(s, 200, json!({
+                "since": since, "until": now_secs(), "bucket": bucket,
+                "alerts": {"t": tr.iter().map(|r| r.0).collect::<Vec<_>>(), "high": tr.iter().map(|r| r.1).collect::<Vec<_>>(),
+                           "medium": tr.iter().map(|r| r.2).collect::<Vec<_>>(), "info": tr.iter().map(|r| r.3).collect::<Vec<_>>()},
+                "fleet": {"since": fsince, "bucket": fbucket, "t": fl.iter().map(|r| r.0).collect::<Vec<_>>(), "established": fl.iter().map(|r| r.1).collect::<Vec<_>>(),
+                          "syn_recv": fl.iter().map(|r| r.2).collect::<Vec<_>>(), "listeners": fl.iter().map(|r| r.3).collect::<Vec<_>>()},
+                "top_hosts": db::top_hosts_by_alerts(c, now_secs().saturating_sub(secs), 6)?.iter().map(|(id, n, k, h)| json!({"id": id, "name": n, "count": k, "high": h})).collect::<Vec<_>>(),
+                "exposure": ex,
+            }));
+        }
+        ("GET", "/api/insights/exposure") => {
+            let (groups, summary) = insights::exposure(&db::all_listeners(c)?, now_secs());
+            json_resp(s, 200, json!({"groups": groups, "summary": summary}));
+        }
+        ("GET", "/api/insights/traffic") => {
+            let mut lp: std::collections::HashMap<String, std::collections::HashSet<u16>> = std::collections::HashMap::new();
+            for l in db::all_listeners(c)? {
+                lp.entry(l.host_id).or_default().insert(l.port);
+            }
+            json_resp(s, 200, insights::traffic(&db::all_conns(c)?, &lp));
+        }
+        ("GET", "/api/insights/threats") => {
+            let secs: u64 = match req.query.get("range").map(String::as_str) {
+                Some("1h") => 3600,
+                Some("7d") => 7 * 86400,
+                Some("30d") => 30 * 86400,
+                _ => 86400,
+            };
+            let rows = db::threats(c, now_secs().saturating_sub(secs))?;
+            let live: std::collections::HashMap<String, u32> = {
+                let mut m = std::collections::HashMap::new();
+                for cn in db::all_conns(c)? {
+                    if let Some((ip, _)) = insights::split_hostport(&cn.remote) {
+                        *m.entry(ip.to_string()).or_default() += 1;
+                    }
+                }
+                m
+            };
+            json_resp(s, 200, json!({"sources": rows.iter().map(|r| json!({
+                "ip": r.ip, "count": r.count, "high": r.high, "kinds": r.kinds, "hosts": r.hosts, "first": r.first, "last": r.last,
+                "internal": insights::is_internal(&r.ip), "connections_now": live.get(&r.ip).copied().unwrap_or(0)})).collect::<Vec<_>>()}));
+        }
+        ("GET", "/api/insights/source") => {
+            let Some(ip) = req.query.get("ip").map(String::as_str).filter(|v| insights::valid_ip(v)) else {
+                return Ok(err(s, 400, "a valid IP address is required"));
+            };
+            let alerts = db::alerts_filtered(c, &db::AlertFilter { source: Some(ip), include_acked: true, limit: 200, ..Default::default() })?;
+            let conns = db::conns_from_ip(c, ip)?;
+            let mut kinds: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+            let mut hosts: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+            for a in &alerts {
+                *kinds.entry(a.kind.as_str()).or_default() += 1;
+                *hosts.entry(a.host.as_str()).or_default() += 1;
+            }
+            json_resp(s, 200, json!({
+                "ip": ip, "internal": insights::is_internal(ip), "conns_total": db::count_conns_from_ip(c, ip)?,
+                "alerts": alerts.iter().map(alert_json_full).collect::<Vec<_>>(),
+                "kinds": kinds, "hosts": hosts,
+                "conns": conns.iter().map(|x| json!({"host_id": x.host_id, "host": x.host, "proto": x.proto, "state": x.state, "local": x.local, "remote": x.remote, "process": x.process})).collect::<Vec<_>>(),
+            }));
+        }
+        ("GET", "/api/insights/health") => {
+            if rank < role_rank("admin") {
+                return Ok(forbidden(s));
+            }
+            let hosts = db::hosts(c)?;
+            let now = now_secs();
+            let users = db::users(c)?;
+            let dbp = st.dir.join("netwatch.db");
+            let size = |p: std::path::PathBuf| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            let ver = env!("CARGO_PKG_VERSION");
+            let url = db::get_setting(c, "webhook_url")?.filter(|u| !u.is_empty());
+            json_resp(s, 200, json!({
+                "server": {"version": ver, "started": st.started, "now": now, "db_bytes": size(dbp.clone()) + size(st.dir.join("netwatch.db-wal")), "tls": HSTS.load(Ordering::Relaxed),
+                           "report_interval": db::get_setting(c, "report_interval")?, "down_after": db::get_setting(c, "down_after")?},
+                "tables": db::table_counts(c)?.into_iter().map(|(t, n)| json!({"table": t, "rows": n})).collect::<Vec<_>>(),
+                "retention": {"metrics_days": 7, "alerts_days": 90, "audit_days": 90},
+                "agents": hosts.iter().map(|h| json!({"id": h.id, "name": h.name, "version": h.version, "os": h.os, "status": h.status, "last_seen": h.last_seen,
+                           "is_root": h.is_root, "cert_days": (h.cert_expires as i64 - now as i64).div_euclid(86400), "version_ok": h.version == ver})).collect::<Vec<_>>(),
+                "webhook": {"configured": url.is_some(), "target": url.as_deref().map(super::webhook::mask),
+                            "min_severity": db::get_setting(c, "webhook_min_severity")?.unwrap_or_else(|| "MEDIUM".into()),
+                            "format": url.as_deref().map(|u| super::webhook::effective_format(c, u))},
+                "metrics_endpoint": db::get_setting(c, "metrics_token_hash")?.map_or(false, |h| !h.is_empty()),
+                "users": {"admin": users.iter().filter(|u| u.role == "admin" && !u.disabled).count(), "operator": users.iter().filter(|u| u.role == "operator" && !u.disabled).count(),
+                          "viewer": users.iter().filter(|u| u.role == "viewer" && !u.disabled).count(), "disabled": users.iter().filter(|u| u.disabled).count(),
+                          "with_2fa": users.iter().filter(|u| u.totp_secret.is_some() && !u.disabled).count(), "must_change": users.iter().filter(|u| u.must_change).count()},
+                "mutes_active": db::mutes(c)?.iter().filter(|m| m.active).count(),
             }));
         }
         ("GET", "/api/search") => {
@@ -924,6 +1034,7 @@ pub fn cmd(args: &[String]) {
         sessions: Mutex::new(HashMap::new()),
         fails: Mutex::new(Fails::default()),
         active: AtomicUsize::new(0),
+        started: now_secs(),
     });
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };

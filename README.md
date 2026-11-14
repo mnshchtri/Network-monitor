@@ -150,12 +150,23 @@ The last enabled admin cannot be disabled, demoted or deleted. Upgrading from a 
 - Lockout: 5 failed logins from one IP or 10 for one account locks it for 5 minutes. (Per-account lockout means someone who knows a username can lock that user out for 5 minutes; that is the usual trade-off against guessing.)
 - Host-header allowlist (DNS rebinding), CSRF header and Origin checks, strict Content-Security-Policy with no third-party assets, agent-supplied text rendered as text, never HTML.
 
+#### Analysis pages
+
+The sidebar is grouped into **Monitor** (Overview, Alerts, Hosts), **Analyze** (Threat sources, Exposure, Traffic), **Manage** (Maintenance, System health) and **Account** (Sessions, Audit log), with live badges for open alerts and risky exposures.
+
+- **Overview** leads with eight risk cards, then *Alerts over time* (stacked by severity), whole-fleet established and half-open connection trends, the busiest hosts, an attack-surface summary and the items that need attention. 24 h / 7 d switch.
+- **Threat sources.** Every address named in alerts (scans, brute force, floods), ranked by high-severity alerts, with the alert types it used, how many hosts it hit, how many connections it holds right now and when it was first and last seen. Click one to investigate: what it did, which hosts it touched, its alerts and its current connections. For external addresses the page suggests copy-paste blocking commands (`ufw`, `iptables`/`ip6tables`, `nftables`) to run on the affected host; for internal addresses it warns against blocking blindly. netwatch itself never changes your firewall.
+- **Exposure.** Everything listening across the fleet, grouped by port, with a plain-language reason when a service is risky to expose (databases, remote desktop, Docker API, Redis, Memcached, SMB, clear-text protocols...). Loopback-only listeners are never counted as exposed, and IPv4+IPv6 binds of the same port count once. Shows what opened in the last 24 hours.
+- **Traffic.** Top inbound sources (with how many distinct ports each touched, which is what a scan looks like), top outbound destinations, most-hit local ports, busiest processes, connection states and per-host load. Based on the latest agent reports (up to 2000 connections per host); loopback peers are ignored.
+- **System health** (admins). Checks with a verdict: agents reporting, version skew, agents without root, certificates about to expire, webhook and Prometheus configured, admins without two-factor, TLS. Plus account counts, stored-data sizes against retention, and per-agent details.
+- **Hosts** is a sortable, filterable table of the whole fleet.
+
 #### Fleet overview, themes, keyboard and accessibility
 
 - **Fleet overview.** The landing page leads with what needs attention: hosts down, unacknowledged HIGH alerts, new externally reachable listeners, agent certificates expiring within 90 days, agents running without root, active maintenance windows, the top attacking sources of the last 24 hours and an activity-by-type breakdown. Click any item to jump to it. Muted alerts are excluded.
 - **Agent certificate expiry.** Agent certificates last until 1 January of (issue year + 5). The server tracks this per host and flags certificates within 90 days of expiry (re-enroll with `netwatch agent enroll --force`). Hosts enrolled before this tracking existed are derived from their enrollment date.
 - **Light and dark themes.** Follows your system setting by default; the header button or `t` switches and remembers the choice. The theme is applied before the first paint, so there is no flash.
-- **Keyboard.** `/` search, `g a` overview, `g m` maintenance, `g s` sessions, `g u` audit log, `j`/`k` move between table rows, `Enter` opens, `t` theme, `?` help, `Esc` closes panels.
+- **Keyboard.** `/` search, `g o` overview, `g a` alerts, `g h` hosts, `g t` threat sources, `g e` exposure, `g n` traffic, `g m` maintenance, `g y` system health, `g s` sessions, `g u` audit log, `j`/`k` move between table rows, `Enter` opens, `t` theme, `?` help, `Esc` closes panels.
 - **Accessibility.** Skip link, labelled landmarks and controls, a live region for connection changes, focus-trapped dialogs that return focus when closed, keyboard focus preserved across the 3-second refresh, status shown as text as well as colour, and respect for reduced-motion. Text/background contrast meets WCAG AA (4.5:1) in both themes; all 52 colour pairs were computed from the stylesheet.
 - **Phones and tablets.** Below 820 px the host list becomes a slide-in menu and wide tables scroll sideways.
 
