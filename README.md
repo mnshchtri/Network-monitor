@@ -43,6 +43,18 @@ netwatch up
 
 First run creates the server CA, enrolls this machine as a monitored host and asks you to choose the web dashboard password. After that it starts the server, the agent and the dashboard (`http://127.0.0.1:8080`) together, prefixes each component's log lines, restarts anything that crashes and stops them all on Ctrl-C. Options: `--port`, `--web-listen`, `--no-agent`, `--no-web`, `--dir`, `--agent-dir`. Use `sudo netwatch up` to see process names for every socket. For always-on use, install the systemd services below instead.
 
+**Run it in the background** with the control script (no terminal needs to stay open):
+
+```sh
+scripts/netwatch.sh start        # starts `netwatch up` detached; prints the dashboard URL
+scripts/netwatch.sh status       # pid, uptime, components, URL
+scripts/netwatch.sh logs         # follow the log
+scripts/netwatch.sh restart
+scripts/netwatch.sh stop         # graceful (like Ctrl-C), escalates to SIGTERM/SIGKILL only if it hangs
+```
+
+Anything after `start` is passed to `netwatch up` (`scripts/netwatch.sh start --web-listen 127.0.0.1:9090 --no-agent`). The script records its own pid and log under `~/.local/state/netwatch` (override with `NETWATCH_RUN_DIR`) and uses `NETWATCH_BIN` or `target/release/netwatch` or `netwatch` from `PATH`. It only ever signals the process in its own pid file, and only if that process really is netwatch, so a stale or recycled pid can't make it kill something else. `netwatch up` itself refuses unknown options instead of silently ignoring them.
+
 ## Usage: fleet mode (agent / server / dashboard)
 
 Monitor many servers from one place, the way Zabbix does.

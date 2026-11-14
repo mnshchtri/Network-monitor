@@ -84,6 +84,23 @@ pub fn cmd(args: &[String]) {
         print!("{HELP}");
         return;
     }
+    // Refuse anything we don't understand: silently ignoring a mistyped option would start the
+    // services with defaults (and against the default data directories) instead of what was asked.
+    const VALUE_OPTS: [&str; 4] = ["--port", "--web-listen", "--dir", "--agent-dir"];
+    const FLAG_OPTS: [&str; 2] = ["--no-agent", "--no-web"];
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if VALUE_OPTS.contains(&a) {
+            if i + 1 >= args.len() || args[i + 1].starts_with("--") {
+                fail(&format!("{a} needs a value"));
+            }
+            i += 1;
+        } else if !FLAG_OPTS.contains(&a) {
+            fail(&format!("unknown option '{a}'. See: netwatch up --help"));
+        }
+        i += 1;
+    }
     let exe = std::env::current_exe().unwrap_or_else(|e| fail(&format!("cannot locate own binary: {e}")));
     let dir: PathBuf = opt(args, "--dir").map(PathBuf::from).unwrap_or_else(default_server_dir);
     let agent_dir: PathBuf = opt(args, "--agent-dir").map(PathBuf::from).unwrap_or_else(default_agent_dir);
