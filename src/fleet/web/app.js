@@ -3,7 +3,8 @@
 const $app = document.getElementById("app");
 const S = { me: null, view: "overview", hosts: [], openAlerts: 0, sel: null, tab: "alerts", tag: null,
   showAcked: false, filter: "", data: null, alerts: [], online: true, timer: null, sessions: [], audit: null,
-  risk: null, ov: null, ovRange: "24h", exposure: null, traffic: null, threats: null, tRange: "24h", source: null, srcData: null, health: null, expanded: {}, expOnly: true, expRisky: false, hSort: { k: "status", dir: 1 }, riskyExposed: 0, threatSources: 0, nav: false, aRange: "24h", aSev: "", aMine: false, cRange: "6h", metrics: null, timeline: null, mutes: [], q: "", search: null, drawer: null, editTags: false };
+  risk: null, ov: null, ovRange: "24h", exposure: null, traffic: null, threats: null, tRange: "24h", source: null, srcData: null, health: null, expanded: {}, expOnly: true, expRisky: false, hSort: { k: "status", dir: 1 }, riskyExposed: 0, threatSources: 0, nav: false, aRange: "24h", aSev: "", aMine: false, cRange: "6h", metrics: null, timeline: null, mutes: [], q: "", search: null, drawer: null, editTags: false,
+  ruleMap: null, ruleList: null, evq: "", evRange: "24h", events: null, incidents: null, incRange: "7d", incidentsOv: null, ovEvents: null, riskScores: null, mitre: null, mitreRange: "7d", rules: null, rulesRange: "7d", compliance: null, compRange: "30d", fw: "pci_dss", expandedInc: {}, expandedRule: {}, openIncidents: 0, paused: false, applying: false, settingHash: false };
 const canAck = () => S.me && (S.me.role === "operator" || S.me.role === "admin");
 const RANGES = { "1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000, "all": 0 };
 const KINDS = ["NEW_LISTENER", "PORT_SCAN", "BRUTE_FORCE", "CONN_BURST", "CONN_FLOOD", "SYN_FLOOD", "SYN_COOKIES", "LISTEN_OVERFLOW", "RST_STORM", "HOST_DOWN", "HOST_UP"];
@@ -26,7 +27,7 @@ function h(tag, attrs, ...kids) {
     else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
     else if (v !== false && v != null) e.setAttribute(k, v === true ? "" : v);
   }
-  for (const c of kids.flat()) if (c != null && c !== false) e.append(c.nodeType ? c : document.createTextNode(String(c)));
+  for (const c of kids.flat(Infinity)) if (c != null && c !== false) e.append(c.nodeType ? c : document.createTextNode(String(c)));
   return e;
 }
 function svg(tag, attrs) {
@@ -55,7 +56,7 @@ function showLogin(msg) {
   const pw = h("input", { type: "password", name: "password", autocomplete: "current-password", required: true });
   const code = h("input", { type: "text", name: "code", inputmode: "numeric", autocomplete: "one-time-code", maxlength: "6", pattern: "[0-9]{6}" });
   const codeRow = h("label", { hidden: true }, "Two-factor code", code);
-  const form = h("form", {}, h("h1", {}, "net", h("span", {}, "watch")),
+  const form = h("form", {}, h("h1", {}, icon("shield"), h("span", { class: "wm" }, "net", h("span", {}, "watch"))), h("div", { class: "tag" }, "Network security monitoring"),
     h("label", {}, "Username", user), h("label", {}, "Password", pw), codeRow,
     h("button", { class: "primary", type: "submit" }, "Sign in"), err);
   form.addEventListener("submit", async e => {
@@ -95,22 +96,40 @@ function alertQuery(extra) {
   return "/api/alerts?limit=500" + (S.showAcked ? "&all=1" : "") + sinceParam(S.aRange) + (S.aSev ? "&severity=" + S.aSev : "") +
     (S.aMine ? "&assignee=me" : "") + (S.tag ? "&tag=" + encodeURIComponent(S.tag) : "") + (extra || "");
 }
+async function loadOverview() {
+  const [risk, ov, ev, rs, inc] = await Promise.all([api("/api/risk"), api("/api/insights/overview?range=" + S.ovRange), api("/api/events?range=" + S.ovRange), api("/api/insights/risk"), api("/api/insights/incidents?range=" + S.ovRange)]);
+  S.risk = risk; S.ov = ov; S.ovEvents = ev; S.riskScores = rs; S.incidentsOv = inc;
+}
+async function loadEvents() {
+  try { return await api("/api/events?range=" + S.evRange + "&q=" + encodeURIComponent(S.evq)); }
+  catch (e) {
+    if (e.message === "login") throw e;   // a bad query is shown inline, it must not look like a server outage
+    return { error: e.message, rows: [], total: 0, shown: 0, warnings: [], facets: { level: [], rule: [], host: [], source: [], mitre: [] }, histogram: { since: 0, bucket: 3600, t: [], low: [], medium: [], high: [], critical: [] } };
+  }
+}
 async function refresh() {
   try {
     if (!S.me || S.me.must_change === undefined) S.me = await api("/api/me");
     if (S.me.must_change) return showChangePassword();
     const sum = await api("/api/summary");
-    S.hosts = sum.hosts; S.openAlerts = sum.open_alerts; S.riskyExposed = sum.risky_exposed || 0; S.threatSources = sum.threat_sources || 0;
+    S.hosts = sum.hosts; S.openAlerts = sum.open_alerts; S.riskyExposed = sum.risky_exposed || 0; S.threatSources = sum.threat_sources || 0; S.openIncidents = sum.open_incidents || 0;
     if (!S.online) announce("Connection restored");
     S.online = true;
     if (S.tag && !S.hosts.some(x => x.tags.includes(S.tag))) S.tag = null;
+    await loadRules();
     switch (S.view) {
       case "sessions": S.sessions = (await api("/api/sessions")).sessions; break;
       case "audit": S.audit = await api("/api/audit?limit=500"); break;
       case "maint": S.mutes = (await api("/api/mutes")).mutes; break;
-      case "search": case "hostlist": break;
-      case "overview": S.risk = await api("/api/risk"); S.ov = await api("/api/insights/overview?range=" + S.ovRange); break;
+      case "search": break;
+      case "hostlist": S.riskScores = await api("/api/insights/risk"); break;
+      case "overview": await loadOverview(); break;
       case "alerts": S.alerts = (await api(alertQuery())).alerts; break;
+      case "incidents": S.incidents = await api("/api/insights/incidents?range=" + S.incRange); break;
+      case "events": S.events = await loadEvents(); break;
+      case "mitre": S.mitre = await api("/api/insights/mitre?range=" + S.mitreRange); break;
+      case "rules": S.rules = await api("/api/rules?range=" + S.rulesRange); break;
+      case "compliance": if (S.me.role === "admin") S.compliance = await api("/api/insights/compliance?range=" + S.compRange); break;
       case "threats":
         if (S.source) { S.srcData = await api("/api/insights/source?ip=" + encodeURIComponent(S.source)); }
         else S.threats = (await api("/api/insights/threats?range=" + S.tRange)).sources;
@@ -120,8 +139,9 @@ async function refresh() {
       case "health": S.health = await api("/api/insights/health"); break;
       default:
         if (S.sel && !S.hosts.some(x => x.id === S.sel)) S.sel = null;
-        if (!S.sel) { S.view = "overview"; S.risk = await api("/api/risk"); S.ov = await api("/api/insights/overview?range=" + S.ovRange); break; }
+        if (!S.sel) { S.view = "overview"; await loadOverview(); break; }
         S.data = await api("/api/host/" + S.sel);
+        S.riskScores = await api("/api/insights/risk");
         if (S.tab === "alerts") S.alerts = (await api(alertQuery("&host=" + S.sel))).alerts;
         else if (S.tab === "trends") S.metrics = await api("/api/host/" + S.sel + "/metrics?range=" + S.cRange);
         else if (S.tab === "timeline") S.timeline = (await api("/api/host/" + S.sel + "/timeline")).events;
@@ -140,8 +160,10 @@ function setNav(open) { S.nav = open; document.body.classList.toggle("nav-open",
 const go = (view, sel, tab) => {
   setNav(false);
   if (view === "hosts" && !sel) view = "overview";
+  const pg = pageById(view); if (pg && pg.admin && S.me && S.me.role !== "admin") view = "overview";
   if (view !== "threats") S.source = null;
-  S.view = view; S.sel = sel ?? null; S.tab = tab || "alerts"; S.filter = ""; S.data = null; S.editTags = false; refresh();
+  S.view = view; S.sel = sel ?? null; S.tab = tab || "alerts"; S.filter = ""; S.data = null; S.editTags = false;
+  setHash(); refresh();
 };
 const goSource = ip => { S.source = ip; S.srcData = null; go("threats"); };
 
@@ -149,8 +171,8 @@ const goSource = ip => { S.source = ip; S.srcData = null; go("threats"); };
 function shell() {
   if (document.getElementById("shell")) return;
   $app.replaceChildren(h("div", { id: "shell", class: "shell" }, h("header", { id: "hdr" }),
-    h("main", {}, h("aside", { id: "side", "aria-label": "Hosts and sections" }), h("section", { id: "content", class: "content", tabindex: "-1", "aria-label": "Main content" })),
-    h("div", { id: "drawer" }), h("div", { id: "navscrim", onclick: () => setNav(false) }), h("div", { id: "help" }),
+    h("main", {}, h("aside", { id: "side", "aria-label": "Primary" }), h("section", { id: "content", class: "content", tabindex: "-1", "aria-label": "Main content" })),
+    h("div", { id: "drawer" }), h("div", { id: "navscrim", onclick: () => setNav(false) }), h("div", { id: "help" }), h("div", { id: "palette" }), h("div", { id: "toasts" }),
     h("div", { id: "live", class: "sr", role: "status", "aria-live": "polite" })));
 }
 /* The page re-renders on every poll; remember which control had keyboard focus and put it back,
@@ -173,78 +195,19 @@ function restoreFocus(f) {
 function render() {
   shell();
   const savedFocus = saveFocus();
-  const up = S.hosts.filter(x => x.status === "up").length, down = S.hosts.filter(x => x.status === "down").length;
-  const hdr = document.getElementById("hdr");
-  const keepSearch = document.activeElement && document.activeElement.id === "gsearch";
-  const box = h("input", { type: "search", id: "gsearch", class: "gsearch", placeholder: "Search hosts, ports, processes, IPs, alerts…", value: S.q, "aria-label": "Search",
-    oninput: e => { S.q = e.target.value; }, onkeydown: e => { if (e.key === "Enter") runSearch(); } });
-  hdr.replaceChildren(
-    h("button", { id: "burger", class: "burger icon", "aria-label": "Open menu", "aria-expanded": String(S.nav), "aria-controls": "side", onclick: () => setNav(!S.nav) }, "☰"),
-    h("div", { class: "brand" }, "net", h("span", {}, "watch")),
-    h("div", { class: "stat" }, h("b", {}, S.hosts.length), "hosts"),
-    h("div", { class: "stat ok" }, h("b", {}, up), "up"),
-    h("div", { class: "stat" + (down ? " bad" : "") }, h("b", {}, down), "down"),
-    h("div", { class: "stat" + (S.openAlerts ? " warn" : "") }, h("b", {}, S.openAlerts), "open alerts"),
-    box, h("div", { class: "grow" }),
-    h("div", { class: "conn" + (S.online ? "" : " dead") }, S.online ? "● live" : "● server unreachable"),
-    h("div", { class: "userbox" }, h("button", { class: "icon", title: "Keyboard shortcuts (?)", "aria-label": "Keyboard shortcuts", onclick: toggleHelp }, "?"),
-      h("button", { class: "icon", title: "Switch theme (t)", "aria-label": "Switch to " + (curTheme() === "light" ? "dark" : "light") + " theme", onclick: () => setTheme(curTheme() === "light" ? "dark" : "light") }, curTheme() === "light" ? "☾" : "☀"),
-      h("span", {}, S.me.username), h("span", { class: "role " + S.me.role }, S.me.role),
-      h("button", { onclick: async () => { await api("/api/logout", {}).catch(() => {}); showLogin(); } }, "Sign out")));
-  if (keepSearch) { box.focus(); box.setSelectionRange(box.value.length, box.value.length); }
-
-  const side = document.getElementById("side");
-  const tags = [...new Set(S.hosts.flatMap(x => x.tags))].sort();
-  const shown = S.hosts.filter(x => !S.tag || x.tags.includes(S.tag));
+  renderHeader(); renderSidebar();
   const admin = S.me.role === "admin";
-  const hostItem = x => h("div", { class: "host" + (S.view === "hosts" && S.sel === x.id ? " sel" : ""), tabindex: "0", role: "button", "aria-current": S.view === "hosts" && S.sel === x.id ? "page" : null, onclick: () => go("hosts", x.id),
-    onkeydown: e => { if (e.key === "Enter") go("hosts", x.id); } }, dot(x.status), h("div", { class: "n" }, h("div", {}, x.name), h("div", { class: "sub" }, x.status === "up" ? x.addr : x.status + " · " + ago(x.last_seen))), x.open_alerts ? h("span", { class: "badge" }, x.open_alerts) : null);
-  const nav = (view, label, icon, badge, badgeClass) => h("div", { class: "navitem" + (S.view === view ? " sel" : ""), tabindex: "0", role: "button", "aria-current": S.view === view ? "page" : null,
-    onclick: () => { S.source = null; go(view); }, onkeydown: e => { if (e.key === "Enter") { S.source = null; go(view); } } },
-    h("span", { class: "ico", "aria-hidden": "true" }, icon), h("span", { class: "grow" }, label), badge ? h("span", { class: badgeClass || "count" }, badge) : null);
-  const group = t => h("div", { class: "navgroup" }, t);
-  side.replaceChildren(...[
-    tags.length ? h("div", { class: "tagbar" }, h("span", { class: "chip" + (S.tag ? "" : " on"), onclick: () => { S.tag = null; refresh(); } }, "all"),
-      tags.map(t => h("span", { class: "chip" + (S.tag === t ? " on" : ""), onclick: () => { S.tag = S.tag === t ? null : t; refresh(); } }, t))) : null,
-    group("Monitor"), nav("overview", "Overview", "◈"), nav("alerts", "Alerts", "⚠", S.openAlerts || "", "badge"), nav("hostlist", "Hosts", "▤", S.hosts.length),
-    group("Analyze"), nav("threats", "Threat sources", "☠", S.threatSources || ""), nav("exposure", "Exposure", "◎", S.riskyExposed || "", "badge"), nav("traffic", "Traffic", "⇅"),
-    group("Manage"), nav("maint", "Maintenance", "⚒"), admin && nav("health", "System health", "♥"),
-    group("Hosts" + (S.tag ? " · " + S.tag : "")), ...shown.map(hostItem),
-    h("div", { class: "side-nav" }, nav("sessions", "Sessions", "⚿"), admin && nav("audit", "Audit log", "☰"))].filter(k => k != null && k !== false));
-
   const c = document.getElementById("content"), keep = c.scrollTop;
   let kids;
-  const VIEWS = { overview: overviewView, alerts: alertsPage, hostlist: hostsPage, threats: threatsView, exposure: exposureView, traffic: trafficView, health: healthView, maint: maintView, sessions: sessionsView, search: searchView };
+  const VIEWS = { overview: overviewView, alerts: alertsPage, incidents: incidentsView, hostlist: hostsPage, events: eventsView, threats: threatsView, mitre: mitreView, rules: rulesView, exposure: exposureView, traffic: trafficView, compliance: complianceView, health: healthView, maint: maintView, sessions: sessionsView, search: searchView };
   if (S.view === "audit" && admin) kids = auditView();
   else if (S.view === "health" && !admin) kids = [h("div", { class: "empty" }, "System health is available to admins.")];
   else if (S.view === "hosts" && S.sel && S.data) kids = hostView();
-  else if (!S.hosts.length && ["overview", "alerts", "hostlist"].includes(S.view)) kids = [h("div", { class: "empty" }, "No agents enrolled yet. Run ", h("code", {}, "netwatch server token"), " on the server and follow the printed command on a host to monitor.")];
+  else if (!S.hosts.length && ["overview", "alerts", "hostlist", "incidents"].includes(S.view)) kids = [h("div", { class: "empty" }, h("div", { class: "big" }, "No agents enrolled yet"), "Run ", h("code", {}, "netwatch server token"), " on the server and follow the printed command on a host to monitor.")];
   else kids = (VIEWS[S.view] || overviewView)();
   c.replaceChildren(...kids.filter(k => k != null && k !== false));
   c.scrollTop = keep;
   restoreFocus(savedFocus);
-}
-
-/* ----- fleet risk summary ----- */
-function riskView() {
-  const r = S.risk; if (!r) return null;
-  const card = (k, v, cls) => h("div", { class: "rcard" + (v > 0 && cls ? " " + cls : "") }, h("div", { class: "k" }, k), h("div", { class: "v" }, v));
-  const item = (lead, text, onclick, sub) => h("div", { class: "ritem", tabindex: "0", role: "button", onclick, onkeydown: e => { if (e.key === "Enter") onclick(); } }, lead, h("div", { class: "grow" }, text, sub && h("div", { class: "dim" }, sub)));
-  const attention = [
-    ...r.down.map(x => item(h("span", { class: "sev HIGH" }, "DOWN"), x.name, () => go("hosts", x.id), "silent since " + ago(x.last_seen))),
-    ...r.exposed.map(a => item(h("span", { class: "sev HIGH" }, "NEW PORT"), a.message, () => openAlert(a.id), a.host + " · " + ago(a.ts))),
-    ...r.cert_expiring.map(x => item(h("span", { class: "sev MEDIUM" }, "CERT"), x.name + (x.days < 0 ? " agent certificate expired" : " agent certificate expires in " + x.days + " days"), () => go("hosts", x.id), "re-enroll with: netwatch agent enroll --force")),
-    ...r.non_root.map(x => item(h("span", { class: "sev INFO" }, "NO ROOT"), x.name, () => go("hosts", x.id), "process names are missing for other users' sockets"))];
-  const max = Math.max(1, ...r.kinds.map(k => k.count));
-  const bars = r.kinds.map(k => { const f = h("div", { class: "barfill" }); f.style.width = Math.max(2, k.count / max * 100) + "%"; return h("div", { class: "barrow" }, h("span", { class: "mono" }, k.kind), h("div", { class: "bartrack" }, f), h("span", {}, k.count)); });
-  return h("div", {},
-    h("div", { class: "riskcards" }, card("Hosts down", r.down.length, "bad"), card("Unacked HIGH alerts", r.unacked_high, "bad"), card("New external listeners", r.exposed.length, "bad"),
-      card("Risky exposed services", S.ov ? S.ov.exposure.risky : 0, "bad"), card("Threat sources, 24 h", S.threatSources, "warn"),
-      card("Certs expiring ≤ 90 d", r.cert_expiring.length, "warn"), card("Agents without root", r.non_root.length, "warn"), card("Active maintenance", r.mutes_active)),
-    h("div", { class: "riskgrid" },
-      h("div", { class: "rpanel" }, h("h4", {}, "Needs attention"), attention.length ? attention : h("div", { class: "dim" }, "Nothing needs attention ✔")),
-      h("div", { class: "rpanel" }, h("h4", {}, "Top sources, last 24 h"), r.sources.length ? r.sources.map(x => item(h("b", {}, x.count + "×"), h("span", { class: "mono" }, x.ip), () => goSource(x.ip), x.kinds.join(", ") + " · last " + ago(x.last))) : h("div", { class: "dim" }, "No attributed activity.")),
-      h("div", { class: "rpanel" }, h("h4", {}, "Activity by type, last 24 h"), bars.length ? bars : h("div", { class: "dim" }, "Quiet."))));
 }
 
 /* ----- alerts ----- */
@@ -257,15 +220,15 @@ function alertsBar() {
     h("label", {}, h("input", { type: "checkbox", checked: S.showAcked, onchange: e => { S.showAcked = e.target.checked; refresh(); } }), "show acknowledged"),
     h("div", { class: "grow" }),
     h("a", { class: "btn", href: q("csv"), download: "netwatch-alerts.csv" }, "CSV"), h("a", { class: "btn", href: q("json"), download: "netwatch-alerts.json" }, "JSON"),
-    canAck() && h("button", { onclick: async () => { await api("/api/ack", { all: true, host: S.sel }); refresh(); } }, "Acknowledge all"));
+    canAck() && h("button", { onclick: async () => { await api("/api/ack", { all: true, host: S.sel }); toast("All shown alerts acknowledged"); refresh(); } }, "Acknowledge all"));
 }
 function alertsTable(withHost, rows = S.alerts) {
   if (!rows.length) return h("div", { class: "empty" }, "No alerts match. ✔");
   return tbl(h("thead", {}, h("tr", {}, h("th", {}, "Time"), withHost && h("th", {}, "Host"), h("th", {}, "Severity"), h("th", {}, "Type"), h("th", {}, "Message"), h("th", {}, "Assigned"), h("th", {}, ""))),
     h("tbody", {}, rows.map(a => h("tr", { class: "click" + (a.acked || a.muted ? " acked" : ""), tabindex: "0", onclick: () => openAlert(a.id), onkeydown: e => { if (e.key === "Enter") openAlert(a.id); } },
-      h("td", { title: when(a.ts) }, ago(a.ts)), withHost && h("td", {}, a.host), h("td", {}, h("span", { class: "sev " + a.severity }, a.severity)),
+      h("td", { title: when(a.ts) }, ago(a.ts)), withHost && h("td", {}, a.host), h("td", {}, levelBadge(a.level ?? 0), " ", h("span", { class: "sev " + a.severity }, a.severity)),
       h("td", { class: "mono" }, a.kind), h("td", {}, a.message, a.muted && h("span", { class: "tagpill" }, "muted")), h("td", {}, a.assignee || ""),
-      h("td", {}, a.acked || !canAck() ? "" : h("button", { onclick: async e => { e.stopPropagation(); await api("/api/ack", { id: a.id }); refresh(); } }, "Ack"))))));
+      h("td", {}, a.acked || !canAck() ? "" : h("button", { onclick: async e => { e.stopPropagation(); await api("/api/ack", { id: a.id }); toast("Alert acknowledged"); refresh(); } }, "Ack"))))));
 }
 
 /* ----- alert drawer (assign + comments) ----- */
@@ -278,12 +241,12 @@ async function openAlert(id) {
   const a = d.alert, box = document.getElementById("drawer");
   const ta = h("textarea", { rows: "3", maxlength: "1000", placeholder: "Add a note: what did you find, what was done?", "aria-label": "Comment" });
   const err = h("div", { class: "err" });
-  const act = async fn => { try { await fn(); await openAlert(id); refresh(); } catch (e) { err.textContent = e.message; } };
+  const act = async fn => { try { await fn(); toast("Saved"); await openAlert(id); refresh(); } catch (e) { err.textContent = e.message; } };
   box.replaceChildren(h("div", { class: "scrim", onclick: closeDrawer }), h("aside", { class: "drawer", role: "dialog", "aria-label": "Alert details" },
-    h("div", { class: "dhead" }, h("h3", {}, a.kind), h("button", { onclick: closeDrawer, "aria-label": "Close" }, "✕")),
+    h("div", { class: "dhead" }, h("h3", {}, levelBadge(a.level ?? 0), " ", a.kind), h("button", { onclick: closeDrawer, "aria-label": "Close", class: "icon" }, icon("x"))),
     h("div", { class: "kv" }, h("span", { class: "sev " + a.severity }, a.severity), h("span", {}, a.host), h("span", { class: "dim" }, when(a.ts) + " (" + ago(a.ts) + ")"),
       a.muted && h("span", { class: "tagpill" }, "muted"), a.acked && h("span", { class: "tagpill" }, "acknowledged")),
-    h("p", { class: "msg" }, a.message),
+    h("p", { class: "msg" }, a.message), ruleBlock(a),
     canAck() && h("div", { class: "bar" },
       h("label", {}, "Assigned to ", sel([["", "(nobody)"], ...users.map(u => [u.username, u.username + " (" + u.role + ")"])], a.assignee, v => act(() => api("/api/alert/assign", { id, assignee: v })), "Assignee")),
       h("div", { class: "grow" }), !a.acked && h("button", { onclick: () => act(() => api("/api/ack", { id })) }, "Acknowledge")),
@@ -301,9 +264,9 @@ async function openAlert(id) {
   });
   dr.querySelector("button").focus();
 }
-const SHORTCUTS = [["/", "Focus the search box"], ["g o", "Overview"], ["g a", "Alerts"], ["g h", "Hosts"], ["g t", "Threat sources"], ["g e", "Exposure"], ["g n", "Traffic"],
-  ["g m", "Maintenance"], ["g y", "System health (admins)"], ["g s", "Sessions"], ["g u", "Audit log (admins)"],
-  ["j / k", "Next / previous row in a table"], ["Enter", "Open the focused row"], ["t", "Switch light / dark theme"], ["?", "Show or hide this help"], ["Esc", "Close the open panel"]];
+const SHORTCUTS = [["Ctrl K", "Command palette: jump anywhere, search anything"], ["/", "Focus the search box"], ["g o", "Overview"], ["g a", "Alerts"], ["g i", "Incidents"], ["g h", "Hosts"], ["g v", "Event explorer"],
+  ["g t", "Threat sources"], ["g k", "MITRE ATT&CK"], ["g l", "Detection rules"], ["g e", "Exposure"], ["g n", "Traffic"], ["g c", "Compliance (admins)"], ["g m", "Maintenance"], ["g y", "System health (admins)"],
+  ["g s", "Sessions"], ["g u", "Audit log (admins)"], ["j / k", "Next / previous row in a table"], ["Enter", "Open the focused row"], ["t", "Switch light / dark theme"], ["?", "Show or hide this help"], ["Esc", "Close the open panel"]];
 function toggleHelp() {
   const box = document.getElementById("help");
   if (box.firstChild) { box.replaceChildren(); if (S.helpReturn) S.helpReturn.focus(); return; }
@@ -324,7 +287,7 @@ document.addEventListener("keydown", e => {
   const k = e.key;
   if (Date.now() - gAt < 1200) {
     gAt = 0;
-    const dest = { o: () => go("overview"), a: () => go("alerts"), h: () => go("hostlist"), t: () => { S.source = null; go("threats"); }, e: () => go("exposure"), n: () => go("traffic"), m: () => go("maint"), y: () => S.me.role === "admin" && go("health"), s: () => go("sessions"), u: () => S.me.role === "admin" && go("audit") }[k];
+    const dest = { o: () => go("overview"), a: () => go("alerts"), i: () => go("incidents"), v: () => go("events"), k: () => go("mitre"), l: () => go("rules"), c: () => S.me.role === "admin" && go("compliance"), h: () => go("hostlist"), t: () => { S.source = null; go("threats"); }, e: () => go("exposure"), n: () => go("traffic"), m: () => go("maint"), y: () => S.me.role === "admin" && go("health"), s: () => go("sessions"), u: () => S.me.role === "admin" && go("audit") }[k];
     if (dest) { e.preventDefault(); dest(); return; }
   }
   if (k === "g") { gAt = Date.now(); return; }
@@ -377,6 +340,7 @@ function hostView() {
     tagEditor(x), h("div", { class: "note" }, `${x.os} · agent ${x.version} · id ${x.id}`),
     !x.is_root && h("div", { class: "warnbar" }, "Agent is not running as root: process names are missing for other users' sockets."),
     h("div", { class: "cards" }, card("Listening", x.listeners), card("Established", x.established), card("SYN_RECV", x.syn_recv, x.syn_recv > 10), card("TIME_WAIT", x.time_wait), card("Total sockets", x.total), card("Open alerts", x.open_alerts, x.open_alerts > 0)),
+    hostRiskBox(x.id),
     h("div", { class: "tabs", role: "tablist" }, TABS.map(([k, label]) => h("div", { class: "tab" + (S.tab === k ? " sel" : ""), role: "tab", "aria-selected": String(S.tab === k), tabindex: "0", onclick: () => { S.tab = k; S.filter = ""; refresh(); }, onkeydown: e => { if (e.key === "Enter") { S.tab = k; S.filter = ""; refresh(); } } }, label))),
     ...body];
 }
@@ -419,7 +383,7 @@ function trendsView() {
   const m = S.metrics;
   const bar = h("div", { class: "bar" }, h("div", { class: "seg" }, ["1h", "6h", "24h", "7d"].map(r => h("button", { class: S.cRange === r ? "on" : "", onclick: () => { S.cRange = r; S.metrics = null; refresh(); } }, r))),
     h("span", { class: "note" }, "Each point is the highest value in its time bucket, so short spikes are never averaged away."));
-  if (!m) return [bar, h("div", { class: "empty" }, "Loading…")];
+  if (!m) return [bar, skeleton()];
   return [bar, lineChart("Established connections", "c-accent", m.t, m.established, m.since, m.until, "connections"),
     lineChart("Half-open connections (SYN_RECV): a flood shows up here", "c-bad", m.t, m.syn_recv, m.since, m.until, "half-open"),
     lineChart("TIME_WAIT", "c-warn", m.t, m.time_wait, m.since, m.until, "sockets"), lineChart("Listening sockets: a step up means a port was opened", "c-ok", m.t, m.listeners, m.since, m.until, "listeners")];
@@ -427,7 +391,7 @@ function trendsView() {
 
 /* ----- timeline ----- */
 function timelineView() {
-  const ev = S.timeline; if (!ev) return [h("div", { class: "empty" }, "Loading…")];
+  const ev = S.timeline; if (!ev) return [skeleton()];
   if (!ev.length) return [h("div", { class: "empty" }, "Nothing has happened on this host yet.")];
   return [h("div", { class: "note" }, "Everything on this host in one stream: alerts, host up/down and listener changes, newest first."),
     h("div", { class: "timeline" }, ev.map(e => h("div", { class: "tl" }, h("div", { class: "tldot " + e.severity }), h("div", { class: "tlbody" },
@@ -480,7 +444,7 @@ function sessionsView() {
 }
 
 function auditView() {
-  const d = S.audit; if (!d) return [h("div", { class: "empty" }, "Loading…")];
+  const d = S.audit; if (!d) return [skeleton()];
   const q = S.filter.toLowerCase();
   const rows = d.entries.filter(e => !q || [e.actor, e.action, e.target, e.detail, e.ip].some(v => String(v).toLowerCase().includes(q)));
   const search = h("input", { type: "search", id: "filter", placeholder: "Filter…", value: S.filter, "aria-label": "Filter", oninput: e => { S.filter = e.target.value; const p = e.target.selectionStart; render(); const n = document.getElementById("filter"); n.focus(); n.setSelectionRange(p, p); } });
@@ -531,30 +495,6 @@ function stackedBars(title, t, series, since, until, bucket, unit) {
   box.append(svgEl, tip); return box;
 }
 
-/* ---------- overview ---------- */
-function overviewView() {
-  const ov = S.ov, kids = [h("div", { class: "title" }, h("h2", {}, S.tag ? "Overview (fleet-wide)" : "Overview"), h("div", { class: "grow" }), rangeSeg(["24h", "7d"], S.ovRange, r => { S.ovRange = r; S.ov = null; refresh(); })), riskView()];
-  if (!ov) return [...kids, h("div", { class: "empty" }, "Loading…")];
-  kids.push(stackedBars("Alerts over time", ov.alerts.t, [{ name: "High", cls: "b-high", vals: ov.alerts.high }, { name: "Medium", cls: "b-medium", vals: ov.alerts.medium }, { name: "Info", cls: "b-info", vals: ov.alerts.info }], ov.since, ov.until, ov.bucket));
-  kids.push(h("div", { class: "twocol" },
-    lineChart("Established connections, whole fleet", "c-accent", ov.fleet.t, ov.fleet.established, ov.fleet.since, ov.until, "connections"),
-    lineChart("Half-open (SYN_RECV), whole fleet: a flood shows up here", "c-bad", ov.fleet.t, ov.fleet.syn_recv, ov.fleet.since, ov.until, "half-open")));
-  const ex = ov.exposure;
-  kids.push(h("div", { class: "riskgrid" },
-    h("div", { class: "rpanel" }, h("h4", {}, "Busiest hosts, " + S.ovRange), ov.top_hosts.length ? ov.top_hosts.map(x => h("div", { class: "ritem", tabindex: "0", role: "button", onclick: () => go("hosts", x.id), onkeydown: e => { if (e.key === "Enter") go("hosts", x.id); } },
-      h("b", {}, x.count + "×"), h("div", { class: "grow" }, x.name, x.high ? h("span", { class: "dim" }, "  " + x.high + " high") : null))) : h("div", { class: "dim" }, "No alerts in this period.")),
-    h("div", { class: "rpanel" }, h("h4", {}, "Attack surface"),
-      h("div", { class: "kvgrid" }, h("div", {}, h("div", { class: "v" }, ex.exposed), h("div", { class: "dim" }, "listeners reachable from the network")),
-        h("div", {}, h("div", { class: "v " + (ex.risky ? "bad" : "") }, ex.risky), h("div", { class: "dim" }, "risky services exposed")),
-        h("div", {}, h("div", { class: "v" }, ex.new24h), h("div", { class: "dim" }, "opened in the last 24 h"))),
-      h("button", { onclick: () => go("exposure") }, "Review exposure →")),
-    h("div", { class: "rpanel" }, h("h4", {}, "Where to look next"),
-      h("div", { class: "ritem", tabindex: "0", role: "button", onclick: () => go("threats") }, h("div", { class: "grow" }, "Threat sources", h("div", { class: "dim" }, "who is hitting you, and what to block"))),
-      h("div", { class: "ritem", tabindex: "0", role: "button", onclick: () => go("traffic") }, h("div", { class: "grow" }, "Traffic", h("div", { class: "dim" }, "top talkers, most-hit ports, busiest processes"))),
-      h("div", { class: "ritem", tabindex: "0", role: "button", onclick: () => go("alerts") }, h("div", { class: "grow" }, "Alerts", h("div", { class: "dim" }, "filter, assign, comment, export"))))));
-  return kids;
-}
-
 /* ---------- alerts page ---------- */
 function alertsPage() {
   return [h("div", { class: "title" }, h("h2", {}, "Alerts" + (S.tag ? " · hosts tagged " + S.tag : ""))), alertsBar(), alertsTable(true)];
@@ -563,15 +503,15 @@ function alertsPage() {
 /* ---------- hosts page ---------- */
 function hostsPage() {
   const q = S.filter.toLowerCase(), { k, dir } = S.hSort;
-  const key = { status: x => ({ down: 0, pending: 1, up: 2 }[x.status] ?? 3), name: x => x.name.toLowerCase(), addr: x => x.addr, os: x => x.os, version: x => x.version, listeners: x => x.listeners, established: x => x.established, syn_recv: x => x.syn_recv, open_alerts: x => x.open_alerts, last_seen: x => x.last_seen }[k] || (x => x.name);
+  const key = { status: x => ({ down: 0, pending: 1, up: 2 }[x.status] ?? 3), name: x => x.name.toLowerCase(), addr: x => x.addr, os: x => x.os, version: x => x.version, listeners: x => x.listeners, established: x => x.established, syn_recv: x => x.syn_recv, open_alerts: x => x.open_alerts, risk: x => ((S.riskScores?.hosts || []).find(r => r.id === x.id) || { score: 0 }).score, last_seen: x => x.last_seen }[k] || (x => x.name);
   const rows = S.hosts.filter(x => (!S.tag || x.tags.includes(S.tag)) && (!q || [x.name, x.addr, x.os, x.tags.join(" "), x.status].some(v => String(v).toLowerCase().includes(q)))).sort((a, b) => { const A = key(a), B = key(b); return (A < B ? -1 : A > B ? 1 : 0) * dir; });
   const search = h("input", { type: "search", id: "filter", placeholder: "Filter hosts…", value: S.filter, "aria-label": "Filter hosts", oninput: e => { S.filter = e.target.value; const p = e.target.selectionStart; render(); const n = document.getElementById("filter"); n.focus(); n.setSelectionRange(p, p); } });
   const onsort = c => { S.hSort = { k: c, dir: S.hSort.k === c ? -S.hSort.dir : 1 }; render(); };
   return [h("div", { class: "title" }, h("h2", {}, "Hosts"), h("span", { class: "dim" }, rows.length + " of " + S.hosts.length)), h("div", { class: "bar" }, search),
-    tbl(h("thead", {}, sortable([["status", "Status"], ["name", "Host"], ["addr", "Address"], ["os", "OS"], ["version", "Agent"], ["listeners", "Listening"], ["established", "Established"], ["syn_recv", "SYN_RECV"], ["open_alerts", "Alerts"], ["", "Tags"], ["last_seen", "Last seen"]], "hSort", onsort)),
+    tbl(h("thead", {}, sortable([["status", "Status"], ["name", "Host"], ["addr", "Address"], ["os", "OS"], ["version", "Agent"], ["listeners", "Listening"], ["established", "Established"], ["syn_recv", "SYN_RECV"], ["open_alerts", "Alerts"], ["risk", "Risk"], ["", "Tags"], ["last_seen", "Last seen"]], "hSort", onsort)),
       h("tbody", {}, rows.map(x => h("tr", { class: "click", tabindex: "0", onclick: () => go("hosts", x.id), onkeydown: e => { if (e.key === "Enter") go("hosts", x.id); } },
         h("td", {}, dot(x.status), " ", x.status), h("td", {}, x.name), h("td", { class: "mono" }, x.addr), h("td", {}, x.os), h("td", {}, x.version), h("td", {}, x.listeners), h("td", {}, x.established),
-        h("td", { class: x.syn_recv > 10 ? "ext" : "" }, x.syn_recv), h("td", {}, x.open_alerts ? h("span", { class: "badge" }, x.open_alerts) : 0), h("td", {}, x.tags.map(t => pill(t))), h("td", { title: when(x.last_seen) }, ago(x.last_seen))))))];
+        h("td", { class: x.syn_recv > 10 ? "ext" : "" }, x.syn_recv), h("td", {}, x.open_alerts ? h("span", { class: "badge" }, x.open_alerts) : 0), h("td", {}, (() => { const r = (S.riskScores?.hosts || []).find(z => z.id === x.id); return r ? riskBar(r.score, r.rating) : ""; })()), h("td", {}, x.tags.map(t => pill(t))), h("td", { title: when(x.last_seen) }, ago(x.last_seen))))))];
 }
 
 /* ---------- threat sources ---------- */
@@ -580,7 +520,7 @@ function threatsView() {
   const rows = S.threats;
   const head = [h("div", { class: "title" }, h("h2", {}, "Threat sources"), h("div", { class: "grow" }), rangeSeg(["1h", "24h", "7d", "30d"], S.tRange, r => { S.tRange = r; S.threats = null; refresh(); })),
     h("div", { class: "note" }, "Addresses named in alerts: port scans, brute force, connection floods. Ranked by high-severity alerts. Click one to investigate and get containment commands.")];
-  if (!rows) return [...head, h("div", { class: "empty" }, "Loading…")];
+  if (!rows) return [...head, skeleton()];
   if (!rows.length) return [...head, h("div", { class: "empty" }, "No attributed attacker activity in this period ✔")];
   return [...head, tbl(h("thead", {}, h("tr", {}, ["Source", "Scope", "High", "Alerts", "Types", "Hosts hit", "Live conns", "First seen", "Last seen"].map(t => h("th", {}, t)))),
     h("tbody", {}, rows.map(x => h("tr", { class: "click", tabindex: "0", onclick: () => goSource(x.ip), onkeydown: e => { if (e.key === "Enter") goSource(x.ip); } },
@@ -589,7 +529,7 @@ function threatsView() {
 }
 function sourceDetail() {
   const d = S.srcData, back = h("button", { onclick: () => { S.source = null; S.srcData = null; refresh(); } }, "← All sources");
-  if (!d || d.ip !== S.source) return [h("div", { class: "title" }, back, h("h2", { class: "mono" }, S.source)), h("div", { class: "empty" }, "Loading…")];
+  if (!d || d.ip !== S.source) return [h("div", { class: "title" }, back, h("h2", { class: "mono" }, S.source)), skeleton()];
   const hostsHit = Object.entries(d.hosts), high = d.alerts.filter(a => a.severity === "HIGH").length, first = d.alerts.length ? Math.min(...d.alerts.map(a => a.ts)) : 0, v6 = d.ip.includes(":");
   const cmds = d.internal ? null : [["ufw", `sudo ufw deny from ${d.ip}`], ["iptables", `sudo ${v6 ? "ip6tables" : "iptables"} -I INPUT -s ${d.ip} -j DROP`], ["nftables", `sudo nft add rule inet filter input ${v6 ? "ip6" : "ip"} saddr ${d.ip} drop`]];
   return [h("div", { class: "title" }, back, h("h2", { class: "mono" }, d.ip), intTag(d.internal)),
@@ -608,7 +548,7 @@ function sourceDetail() {
 
 /* ---------- exposure ---------- */
 function exposureView() {
-  const d = S.exposure; if (!d) return [h("div", { class: "title" }, h("h2", {}, "Exposure")), h("div", { class: "empty" }, "Loading…")];
+  const d = S.exposure; if (!d) return [h("div", { class: "title" }, h("h2", {}, "Exposure")), skeleton()];
   const q = S.filter.toLowerCase(), sm = d.summary;
   const riskBadge = r => h("span", { class: "sev " + ["INFO", "MEDIUM", "HIGH"][r] }, ["OK", "REVIEW", "RISKY"][r]);
   const groups = d.groups.filter(g => (!S.expOnly || g.exposed_hosts > 0) && (!S.expRisky || g.risk === 2) && (!q || [g.port, g.service, g.why, g.proto, ...g.hosts.flatMap(x => [x.host, x.process, x.addr])].some(v => String(v ?? "").toLowerCase().includes(q))));
@@ -634,7 +574,7 @@ function exposureView() {
 
 /* ---------- traffic ---------- */
 function trafficView() {
-  const t = S.traffic; if (!t) return [h("div", { class: "title" }, h("h2", {}, "Traffic")), h("div", { class: "empty" }, "Loading…")];
+  const t = S.traffic; if (!t) return [h("div", { class: "title" }, h("h2", {}, "Traffic")), skeleton()];
   const peerTable = (rows, inbound) => rows.length ? tbl(h("thead", {}, h("tr", {}, [inbound ? "Source" : "Destination", "Conns", inbound ? "Ports hit" : "Ports", "Hosts"].map(x => h("th", {}, x)))),
     h("tbody", {}, rows.map(r => h("tr", { class: inbound ? "click" : "", tabindex: inbound ? "0" : null, onclick: inbound ? () => goSource(r.ip) : null, onkeydown: inbound ? e => { if (e.key === "Enter") goSource(r.ip); } : null },
       h("td", { class: "mono" }, r.ip, " ", intTag(r.internal)), h("td", {}, r.count), h("td", {}, r.port_count > 8 ? r.ports.join(", ") + " … (" + r.port_count + ")" : r.ports.join(", ")), h("td", {}, r.hosts.join(", ")))))) : h("div", { class: "dim" }, "None.");
@@ -653,7 +593,7 @@ function trafficView() {
 
 /* ---------- system health ---------- */
 function healthView() {
-  const d = S.health; if (!d) return [h("div", { class: "title" }, h("h2", {}, "System health")), h("div", { class: "empty" }, "Loading…")];
+  const d = S.health; if (!d) return [h("div", { class: "title" }, h("h2", {}, "System health")), skeleton()];
   const checks = [], add = (level, text) => checks.push({ level, text });
   const skew = d.agents.filter(a => !a.version_ok), noroot = d.agents.filter(a => !a.is_root && a.status !== "pending"), expiring = d.agents.filter(a => a.cert_days < 90), down = d.agents.filter(a => a.status === "down");
   down.length ? add("bad", down.length + " agent(s) not reporting: " + down.map(a => a.name).join(", ")) : add("ok", "All agents are reporting");
@@ -679,15 +619,16 @@ function healthView() {
         h("td", { class: a.cert_days < 90 ? "ext" : "" }, a.cert_days < 0 ? "expired" : fmtDur(a.cert_days * 86400))))))];
 }
 
-/* ---------- boot ---------- */
-function start() {
+/* ---------- session start (called by boot.js and after login) ---------- */
+async function start() {
   clearInterval(S.timer); S.me = null; S.view = "overview";
-  refresh();
+  try { S.me = await api("/api/me"); } catch (e) { return; }   // api() shows the login form on 401
+  if (S.me.must_change) return showChangePassword();
+  if (location.hash.length > 2) applyHash(); else { setHash(); refresh(); }
   S.timer = setInterval(() => {
-    const id = document.activeElement?.id;
-    // Don't rebuild the page under the user's hands: typing in a filter/search box, or reading a chart tooltip.
-    const tag = document.activeElement?.tagName;
-    if (!document.hidden && id !== "filter" && id !== "gsearch" && tag !== "SELECT" && tag !== "TEXTAREA" && S.view !== "search" && !document.querySelector(".chart:hover")) refresh();
+    const id = document.activeElement?.id, tag = document.activeElement?.tagName;
+    // Don't rebuild the page under the user's hands: typing in a query/filter box, choosing from a dropdown, or reading a chart tooltip.
+    if (S.paused || document.hidden || ["filter", "gsearch", "evq", "pin"].includes(id) || tag === "SELECT" || tag === "TEXTAREA" || S.view === "search" || document.querySelector(".chart:hover")) return;
+    refresh();
   }, 3000);
 }
-api("/api/me").then(m => { S.me = m; start(); }).catch(() => { if (!document.getElementById("shell") && !S.me) showLogin(); });

@@ -3,6 +3,7 @@
 use super::db;
 use super::pki;
 use super::proto::{self, Request, Response};
+use super::rules;
 use super::webhook::{self, Notification};
 use super::util::*;
 use std::fs::{self, File, OpenOptions};
@@ -464,7 +465,16 @@ fn log_alerts(sh: &Shared, host: &str, r: &proto::Report) {
                 let _ = writeln!(
                     f,
                     "{}",
-                    serde_json::json!({"time": fmt_time(a.ts), "host": host, "severity": a.severity, "type": a.kind, "source": a.source, "message": a.message})
+                    {
+                        // SIEM-ready: carries the rule id, 0-15 level and MITRE ATT&CK mapping (Wazuh-style fields).
+                        let rule = rules::by_kind(&a.kind);
+                        serde_json::json!({
+                            "time": fmt_time(a.ts), "host": host, "severity": a.severity, "type": a.kind, "source": a.source, "message": a.message,
+                            "level": rules::level_for(rule, &a.severity),
+                            "rule": rule.map(|r| serde_json::json!({"id": r.id, "name": r.name, "groups": r.groups,
+                                "mitre": if r.technique.is_empty() { serde_json::Value::Null } else { serde_json::json!({"id": r.technique, "technique": r.technique_name, "tactic": rules::tactic_name(r.tactic)}) }}))
+                        })
+                    }
                 );
             }
         }

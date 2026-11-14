@@ -109,7 +109,8 @@ pub fn correlate(alerts: &[AlertRow]) -> Vec<Incident> {
                 return;
             }
             let max_level = session.iter().map(|&i| query::enrich(&alerts[i]).level).max().unwrap_or(0);
-            if session.len() >= 2 || max_level >= 10 {
+            // Low-level chatter (INFO alerts) never makes an incident: at least one medium-or-worse alert is needed.
+            if (session.len() >= 2 && max_level >= 7) || max_level >= 10 {
                 incidents.push((build(alerts, session, "source", src, Some(src), vec![], 0), src.to_string()));
             }
             session.clear();
@@ -127,32 +128,42 @@ pub fn correlate(alerts: &[AlertRow]) -> Vec<Incident> {
 
     // New-listener -> accessed-from-outside correlation.
     let mut used: HashSet<usize> = HashSet::new();
+    let mut attached: Vec<Vec<(String, String)>> = vec![Vec::new(); incidents.len()]; // (host, port) per incident
     for &li in order.iter().filter(|&&i| alerts[i].kind == "NEW_LISTENER") {
         let Some(port) = listener_port(&alerts[li].message) else { continue };
-        for (inc, _) in incidents.iter_mut().filter(|(inc, _)| inc.kind == "source") {
+        for (n, (inc, _)) in incidents.iter_mut().enumerate().filter(|(_, (inc, _))| inc.kind == "source") {
             let host_hit = inc.alerts.iter().any(|&i| alerts[i].host == alerts[li].host);
             let touched = inc.alerts.iter().any(|&i| alerts[i].host == alerts[li].host && port_tokens(&alerts[i].message).contains(port));
             let timely = alerts[li].ts + SOURCE_GAP >= inc.first && alerts[li].ts <= inc.last;
             if host_hit && touched && timely && !inc.alerts.contains(&li) {
                 inc.alerts.push(li);
                 inc.alerts.sort_by_key(|&i| (alerts[i].ts, alerts[i].id));
-                inc.notes.push(format!("A new listener on port {port} ({}) was accessed from {} right after it opened", alerts[li].host, inc.source.as_deref().unwrap_or("outside")));
-                inc.level = (inc.level + 2).min(15);
-                inc.first = inc.first.min(alerts[li].ts);
+                attached[n].push((alerts[li].host.clone(), port.to_string()));
                 used.insert(li);
             }
         }
     }
-    // Rebuild attached incidents so stages/hosts/open reflect the added alert.
+    // Rebuild attached incidents so stages/hosts/open reflect the added alerts, with ONE note per host.
     let incidents: Vec<Incident> = incidents
         .into_iter()
-        .map(|(inc, src)| {
-            if inc.notes.is_empty() {
-                inc
-            } else {
-                let bonus = 2 * inc.notes.len() as u8;
-                build(alerts, &inc.alerts, "source", &src, Some(&src), inc.notes.clone(), bonus.saturating_sub(u8::from(false)))
+        .zip(attached)
+        .map(|((inc, src), att)| {
+            if att.is_empty() {
+                return inc;
             }
+            let mut by_host: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (h, p) in att {
+                by_host.entry(h).or_default().push(p);
+            }
+            let notes: Vec<String> = by_host
+                .into_iter()
+                .map(|(h, mut ports)| {
+                    ports.sort_by_key(|p| p.parse::<u32>().unwrap_or(0));
+                    ports.dedup();
+                    format!("{} new listener{} on port{} {} ({h}) {} accessed from {src} right after opening", ports.len(), if ports.len() == 1 { "" } else { "s" }, if ports.len() == 1 { "" } else { "s" }, ports.join(", "), if ports.len() == 1 { "was" } else { "were" })
+                })
+                .collect();
+            build(alerts, &inc.alerts, "source", &src, Some(&src), notes, 2)
         })
         .collect();
     let mut incidents = incidents;
@@ -180,7 +191,7 @@ pub fn correlate(alerts: &[AlertRow]) -> Vec<Incident> {
         }
         for s in done {
             let max_level = s.iter().map(|&i| query::enrich(&alerts[i]).level).max().unwrap_or(0);
-            if s.len() >= 2 || max_level >= 10 {
+            if (s.len() >= 2 && max_level >= 7) || max_level >= 10 {
                 incidents.push(build(alerts, &s, "host", host, None, vec![], 0));
             }
         }
@@ -285,7 +296,7 @@ mod tests {
         let tactics: Vec<&str> = main.stages.iter().map(|s| s.tactic.as_str()).collect();
         assert_eq!(tactics, vec!["Command and Control", "Discovery", "Credential Access", "Impact"], "stages in the order they happened");
         assert!(main.title.contains("→") && main.title.ends_with("from 203.0.113.9"), "{}", main.title);
-        assert!(main.notes.iter().any(|n| n.contains("port 3306")), "{:?}", main.notes);
+        assert!(main.notes.len() == 1 && main.notes[0].contains("3306") && main.notes[0].contains("accessed from 203.0.113.9"), "{:?}", main.notes);
         assert!(main.level >= 14, "multi-stage + listener correlation raises the level: {}", main.level);
         assert!(main.open && main.first == 1000 && main.last == 1400);
         let late = inc.iter().find(|i| i.source.as_deref() == Some("198.51.100.1")).expect("separate day => separate incident");
@@ -321,6 +332,16 @@ mod tests {
         assert!(!inc.iter().any(|i| i.alerts.contains(&2)), "HOST_UP (index 2) never creates or joins incidents");
         assert!(!inc.iter().any(|i| i.alerts.contains(&3)), "a lone HOST_DOWN is level 9, below the single-alert bar");
         assert!(!inc.iter().any(|i| i.hosts == vec!["web".to_string()]), "one MEDIUM reset storm alone is below the bar");
+    }
+
+    #[test]
+    fn info_chatter_is_not_an_incident() {
+        let alerts = vec![
+            a(1, 1000, "h", "NEW_LISTENER", "INFO", "", "new tcp listener on port 18870 opened by netwatch (pid 1)"),
+            a(2, 1010, "h", "NEW_LISTENER", "INFO", "", "new tcp listener on port 18871 opened by netwatch (pid 1)"),
+            a(3, 1020, "h", "CONN_BURST", "INFO", "9.9.9.9", "a"), a(4, 1030, "h", "CONN_BURST", "INFO", "9.9.9.9", "b"),
+        ];
+        assert!(correlate(&alerts).is_empty(), "INFO-level alerts alone are never an incident");
     }
 
     #[test]

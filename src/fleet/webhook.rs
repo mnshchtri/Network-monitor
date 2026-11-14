@@ -1,7 +1,7 @@
 //! Alert delivery to a webhook (Slack, Discord or generic JSON) over http/https.
 //! Minimal HTTP/1.1 client on std + rustls; bundled root CAs so it works on any server.
 
-use super::db;
+use super::{db, rules};
 use super::util::*;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
@@ -145,8 +145,11 @@ pub fn body(format: &str, batch: &[Notification]) -> String {
             let alerts: Vec<serde_json::Value> = batch
                 .iter()
                 .map(|n| {
+                    let rule = rules::by_kind(&n.kind);
                     serde_json::json!({"time": fmt_time(n.ts), "host": n.host, "severity": n.severity,
-                        "type": n.kind, "source": n.source, "message": n.message})
+                        "type": n.kind, "source": n.source, "message": n.message,
+                        "level": rules::level_for(rule, &n.severity), "rule_id": rule.map(|r| r.id),
+                        "mitre": rule.filter(|r| !r.technique.is_empty()).map(|r| r.technique), "tactic": rule.filter(|r| !r.tactic.is_empty()).map(|r| rules::tactic_name(r.tactic))})
                 })
                 .collect();
             serde_json::json!({"source": "netwatch", "alerts": alerts}).to_string()
@@ -237,6 +240,10 @@ mod tests {
         assert!(body("discord", &[n.clone()]).starts_with("{\"content\":"));
         let g: serde_json::Value = serde_json::from_str(&body("generic", &[n])).unwrap();
         assert_eq!(g["alerts"][0]["type"], "PORT_SCAN");
+        assert_eq!(g["alerts"][0]["rule_id"], 100110);
+        assert_eq!(g["alerts"][0]["level"], 10);
+        assert_eq!(g["alerts"][0]["mitre"], "T1046");
+        assert_eq!(g["alerts"][0]["tactic"], "Discovery");
     }
 
     /// Needs internet: proves TLS + bundled roots work (any HTTP status, even 4xx, means the handshake succeeded).

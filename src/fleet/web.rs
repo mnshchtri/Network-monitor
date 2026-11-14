@@ -33,6 +33,9 @@ const INDEX: &str = include_str!("web/index.html");
 const CSS: &str = include_str!("web/app.css");
 const JS: &str = include_str!("web/app.js");
 const THEME_JS: &str = include_str!("web/theme.js");
+const UI_JS: &str = include_str!("web/ui.js");
+const SIEM_JS: &str = include_str!("web/siem.js");
+const BOOT_JS: &str = include_str!("web/boot.js");
 
 static HSTS: AtomicBool = AtomicBool::new(false);
 
@@ -355,8 +358,9 @@ fn metrics(st: &State, c: &rusqlite::Connection, s: &mut impl Write, req: &Req) 
 }
 
 fn alert_json_full(a: &db::AlertRow) -> Value {
+    let e = query::enrich(a);
     json!({"id": a.id, "host": a.host, "ts": a.ts, "kind": a.kind, "severity": a.severity, "message": a.message,
-           "acked": a.acked, "assignee": a.assignee, "muted": a.muted, "source": a.source})
+           "acked": a.acked, "assignee": a.assignee, "muted": a.muted, "source": a.source, "level": e.level, "rule": e.rule.map(|r| r.id)})
 }
 
 
@@ -441,6 +445,9 @@ fn handle<S: Read + Write>(st: &State, s: &mut S, peer: IpAddr) {
         ("GET", "/app.css") => return send(s, 200, "text/css; charset=utf-8", "no-cache", &[], CSS.as_bytes()),
         ("GET", "/app.js") => return send(s, 200, "text/javascript; charset=utf-8", "no-cache", &[], JS.as_bytes()),
         ("GET", "/theme.js") => return send(s, 200, "text/javascript; charset=utf-8", "no-cache", &[], THEME_JS.as_bytes()),
+        ("GET", "/ui.js") => return send(s, 200, "text/javascript; charset=utf-8", "no-cache", &[], UI_JS.as_bytes()),
+        ("GET", "/siem.js") => return send(s, 200, "text/javascript; charset=utf-8", "no-cache", &[], SIEM_JS.as_bytes()),
+        ("GET", "/boot.js") => return send(s, 200, "text/javascript; charset=utf-8", "no-cache", &[], BOOT_JS.as_bytes()),
         _ => {}
     }
     if !req.path.starts_with("/api/") && req.path != "/metrics" {
@@ -618,8 +625,10 @@ fn route(st: &State, c: &rusqlite::Connection, req: &Req, s: &mut impl Write, a:
             let open: u32 = hosts.iter().map(|h| h.open_alerts).sum();
             let (_, ex) = insights::exposure(&db::all_listeners(c)?, now_secs());
             let sources = db::threats(c, now_secs().saturating_sub(86400))?.len();
+            let a24 = db::alerts_filtered(c, &db::AlertFilter { since: now_secs().saturating_sub(86400), include_acked: true, limit: 5000, ..Default::default() })?;
+            let open_incidents = correlate::correlate(&a24).iter().filter(|i| i.open).count();
             json_resp(s, 200, json!({"hosts": hosts.iter().map(host_json).collect::<Vec<_>>(), "open_alerts": open, "now": now_secs(),
-                                     "risky_exposed": ex["risky"], "threat_sources": sources}));
+                                     "risky_exposed": ex["risky"], "threat_sources": sources, "open_incidents": open_incidents}));
         }
         ("GET", "/api/alerts") => {
             let f = match parse_filter(req, me) {

@@ -150,6 +150,48 @@ The last enabled admin cannot be disabled, demoted or deleted. Upgrading from a 
 - Lockout: 5 failed logins from one IP or 10 for one account locks it for 5 minutes. (Per-account lockout means someone who knows a username can lock that user out for 5 minutes; that is the usual trade-off against guessing.)
 - Host-header allowlist (DNS rebinding), CSRF header and Origin checks, strict Content-Security-Policy with no third-party assets, agent-supplied text rendered as text, never HTML.
 
+#### SIEM features (Wazuh-style)
+
+netwatch turns raw network signals into analyst-ready security events.
+
+- **Detection rules.** Every alert kind is a rule with a stable id (100110-100171), a **0-15 level** (low 0-6, medium 7-9, high 10-11, critical 12-15), groups, a **MITRE ATT&CK** technique and tactic, and reference **compliance** tags. Browse them on *Detection rules*; every alert, drawer, webhook and log line carries the same metadata.
+- **Event explorer** (`g v`). Hunt every alert with a small query language, with facets (rules, hosts, sources, techniques, levels), an event histogram and CSV export. Queries are shareable URLs.
+
+  ```
+  level>=10 src:203.0.113. -mitre:T1046      # high+ events from that network, excluding scans
+  kind:PORT_SCAN,BRUTE_FORCE host:web*       # a,b = OR; * = wildcard
+  tactic:"credential access" ack:false       # quotes keep spaces
+  group:dos assigned:me  "connection flood"  # rule group, my alerts, free text
+  ```
+
+  Fields: `host kind severity source rule level mitre tactic group ack muted assignee msg`. Operators: `field:value`, `level>=10` (also `<= > <`), `-` negates, `a,b` is OR. Queries are evaluated in Rust over fetched rows, never in SQL, so they cannot reach the database layer.
+- **Incidents** (`g i`). Alerts are correlated into attack chains: everything from one source until it goes quiet for 30 minutes forms a campaign, shown as an ordered kill chain (for example *Command and Control → Discovery → Credential Access → Impact*). A listener that opened and was then hit from outside is flagged and raises the level. Alerts without a source cluster per host. At least one medium-or-worse alert is required, so low-level chatter never becomes an incident.
+- **MITRE ATT&CK matrix** (`g k`). All 14 enterprise tactics in kill-chain order with a heat scale for the techniques netwatch detects. Tactics that happen on the host (Execution, Privilege Escalation...) are marked as out of scope for network monitoring rather than faked: pair netwatch with a host agent such as Wazuh or auditd for those.
+- **Host risk score.** A transparent 0-100 score per host and for the fleet: open alerts weighted by level and recency, risky exposed services, agent health. Every point is itemised on the host page ("why this score").
+- **Compliance evidence** (`g c`, admins). PCI DSS v4.0, NIST 800-53, GDPR, HIPAA, CIS v8 and SOC 2: per requirement, the events that serve as evidence and netwatch's own controls (audit integrity, MFA, transport encryption, alerting, agent coverage) with honest Met / Partial / Gap verdicts. It is a reference mapping, **not a certification**.
+
+**Forwarding to Wazuh or any other SIEM.** The server writes every alert as a flat JSON line to `<server dir>/alerts.jsonl` (default `/var/lib/netwatch-server/alerts.jsonl`, or pass `--log`), including `level`, `rule.id`, `rule.groups` and `rule.mitre`:
+
+```json
+{"time":"2026-11-14 18:08:35","host":"web-1","severity":"HIGH","type":"PORT_SCAN","source":"203.0.113.9","level":10,
+ "rule":{"id":100110,"name":"Port scan","groups":["network","recon","scan"],"mitre":{"id":"T1046","technique":"Network Service Discovery","tactic":"Discovery"}},"message":"…"}
+```
+
+For a Wazuh manager/agent on the same host, add the file as a JSON log source in `ossec.conf`:
+
+```xml
+<localfile>
+  <log_format>json</log_format>
+  <location>/var/lib/netwatch-server/alerts.jsonl</location>
+</localfile>
+```
+
+Or push alerts to any HTTP collector with the `generic` webhook (`netwatch server set webhook_format generic`), which includes `level`, `rule_id`, `mitre` and `tactic`, or scrape metrics with Prometheus. This integration is format-compatible by design but has **not been tested against a live Wazuh manager**; expect to write your own Wazuh decoder/rules for the fields you care about.
+
+#### Interface
+
+Enterprise-style navigation grouped as Monitor / Detect / Assess / Manage / Account, with live badges. **Ctrl/Cmd+K** opens a command palette (jump to any page or host, "hunt events for…", toggle theme or density). Every view is a **shareable URL** (`#/events?q=level%3E%3D10`, `#/host/<id>/ports`, `#/threats/<ip>`) and Back/Forward work. Also: toasts for every action, skeleton loaders, a collapsible sidebar, comfortable/compact density, a live/paused refresh toggle, light and dark themes, and keyboard chords (`?` lists them all).
+
 #### Analysis pages
 
 The sidebar is grouped into **Monitor** (Overview, Alerts, Hosts), **Analyze** (Threat sources, Exposure, Traffic), **Manage** (Maintenance, System health) and **Account** (Sessions, Audit log), with live badges for open alerts and risky exposures.
@@ -166,7 +208,7 @@ The sidebar is grouped into **Monitor** (Overview, Alerts, Hosts), **Analyze** (
 - **Fleet overview.** The landing page leads with what needs attention: hosts down, unacknowledged HIGH alerts, new externally reachable listeners, agent certificates expiring within 90 days, agents running without root, active maintenance windows, the top attacking sources of the last 24 hours and an activity-by-type breakdown. Click any item to jump to it. Muted alerts are excluded.
 - **Agent certificate expiry.** Agent certificates last until 1 January of (issue year + 5). The server tracks this per host and flags certificates within 90 days of expiry (re-enroll with `netwatch agent enroll --force`). Hosts enrolled before this tracking existed are derived from their enrollment date.
 - **Light and dark themes.** Follows your system setting by default; the header button or `t` switches and remembers the choice. The theme is applied before the first paint, so there is no flash.
-- **Keyboard.** `/` search, `g o` overview, `g a` alerts, `g h` hosts, `g t` threat sources, `g e` exposure, `g n` traffic, `g m` maintenance, `g y` system health, `g s` sessions, `g u` audit log, `j`/`k` move between table rows, `Enter` opens, `t` theme, `?` help, `Esc` closes panels.
+- **Keyboard.** `/` search, `g o` overview, `g a` alerts, `g i` incidents, `g h` hosts, `g v` event explorer, `g t` threat sources, `g k` MITRE, `g l` rules, `g e` exposure, `g n` traffic, `g c` compliance, `g m` maintenance, `g y` system health, `g s` sessions, `g u` audit log, `Ctrl K` command palette, `j`/`k` move between table rows, `Enter` opens, `t` theme, `?` help, `Esc` closes panels.
 - **Accessibility.** Skip link, labelled landmarks and controls, a live region for connection changes, focus-trapped dialogs that return focus when closed, keyboard focus preserved across the 3-second refresh, status shown as text as well as colour, and respect for reduced-motion. Text/background contrast meets WCAG AA (4.5:1) in both themes; all 52 colour pairs were computed from the stylesheet.
 - **Phones and tablets.** Below 820 px the host list becomes a slide-in menu and wide tables scroll sideways.
 
