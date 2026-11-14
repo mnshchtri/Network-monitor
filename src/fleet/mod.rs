@@ -3,8 +3,11 @@
 
 pub mod agent;
 pub mod auth;
+pub mod correlate;
 pub mod db;
 pub mod insights;
+pub mod query;
+pub mod rules;
 pub mod pki;
 pub mod proto;
 pub mod server;

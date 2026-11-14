@@ -357,6 +357,7 @@ pub struct AlertRow {
     pub acked: bool,
     pub assignee: String,
     pub muted: bool,
+    pub source: String,
 }
 
 pub fn alerts(c: &Connection, host: Option<&str>, include_acked: bool, limit: usize) -> Res<Vec<AlertRow>> {
@@ -376,12 +377,12 @@ pub struct AlertFilter<'a> {
     pub limit: usize,
 }
 
-const ALERT_COLS: &str = "a.id, COALESCE(h.name, a.host_id), a.ts, a.kind, a.severity, a.message, a.acked, COALESCE(a.assignee,''), a.muted";
+const ALERT_COLS: &str = "a.id, COALESCE(h.name, a.host_id), a.ts, a.kind, a.severity, a.message, a.acked, COALESCE(a.assignee,''), a.muted, COALESCE(a.source,'')";
 
 fn alert_row(r: &rusqlite::Row) -> Res<AlertRow> {
     Ok(AlertRow {
         id: r.get(0)?, host: r.get(1)?, ts: r.get::<_, i64>(2)? as u64, kind: r.get(3)?, severity: r.get(4)?,
-        message: r.get(5)?, acked: r.get::<_, i64>(6)? != 0, assignee: r.get(7)?, muted: r.get::<_, i64>(8)? != 0,
+        message: r.get(5)?, acked: r.get::<_, i64>(6)? != 0, assignee: r.get(7)?, muted: r.get::<_, i64>(8)? != 0, source: r.get(9)?,
     })
 }
 

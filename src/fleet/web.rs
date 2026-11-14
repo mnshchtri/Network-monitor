@@ -9,7 +9,7 @@
 
 use super::auth::{self, role_rank};
 use super::db::{self, User};
-use super::insights;
+use super::{correlate, insights, query, rules};
 use super::pki;
 use super::server::default_server_dir;
 use super::util::*;
@@ -356,7 +356,45 @@ fn metrics(st: &State, c: &rusqlite::Connection, s: &mut impl Write, req: &Req) 
 
 fn alert_json_full(a: &db::AlertRow) -> Value {
     json!({"id": a.id, "host": a.host, "ts": a.ts, "kind": a.kind, "severity": a.severity, "message": a.message,
-           "acked": a.acked, "assignee": a.assignee, "muted": a.muted})
+           "acked": a.acked, "assignee": a.assignee, "muted": a.muted, "source": a.source})
+}
+
+
+fn range_secs(v: Option<&String>, default: u64) -> u64 {
+    match v.map(String::as_str) {
+        Some("1h") => 3600,
+        Some("24h") => 86400,
+        Some("7d") => 7 * 86400,
+        Some("30d") => 30 * 86400,
+        Some("90d") => 90 * 86400,
+        _ => default,
+    }
+}
+
+fn technique_url(id: &str) -> String {
+    format!("https://attack.mitre.org/techniques/{}/", id.replace('.', "/"))
+}
+
+fn event_json(e: &query::Enriched) -> Value {
+    let a = e.a;
+    json!({
+        "id": a.id, "ts": a.ts, "host": a.host, "source": a.source, "kind": a.kind, "severity": a.severity, "level": e.level, "class": rules::level_class(e.level),
+        "message": a.message, "acked": a.acked, "muted": a.muted, "assignee": a.assignee,
+        "rule": e.rule.map(|r| json!({"id": r.id, "name": r.name})),
+        "tactic": e.rule.filter(|r| !r.tactic.is_empty()).map(|r| rules::tactic_name(r.tactic)),
+        "mitre": e.rule.filter(|r| !r.technique.is_empty()).map(|r| json!({"id": r.technique, "name": r.technique_name})),
+        "groups": e.rule.map(|r| r.groups.to_vec()).unwrap_or_default(),
+    })
+}
+
+fn quote_if_needed(v: &str) -> String {
+    if v.chars().any(|c| c.is_whitespace() || c == ',') { format!("\"{v}\"") } else { v.to_string() }
+}
+
+fn facet(map: std::collections::HashMap<String, (String, String, u32)>, n: usize) -> Vec<Value> {
+    let mut v: Vec<(String, String, u32)> = map.into_values().collect();
+    v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    v.into_iter().take(n).map(|(label, q, count)| json!({"label": label, "q": q, "count": count})).collect()
 }
 
 // ---------- request handling ----------
@@ -776,6 +814,173 @@ fn route(st: &State, c: &rusqlite::Connection, req: &Req, s: &mut impl Write, a:
                           "with_2fa": users.iter().filter(|u| u.totp_secret.is_some() && !u.disabled).count(), "must_change": users.iter().filter(|u| u.must_change).count()},
                 "mutes_active": db::mutes(c)?.iter().filter(|m| m.active).count(),
             }));
+        }
+        ("GET", "/api/events") => {
+            let qs = req.query.get("q").map(String::as_str).unwrap_or("");
+            if qs.chars().count() > 300 {
+                return Ok(err(s, 400, "query too long"));
+            }
+            let (query, warnings) = match query::parse(qs, &me.username) {
+                Ok(x) => x,
+                Err(e) => return Ok(err(s, 400, &e)),
+            };
+            let range = req.query.get("range");
+            let secs = range_secs(range, 86400);
+            let since = now_secs().saturating_sub(secs);
+            let all = db::alerts_filtered(c, &db::AlertFilter { since, include_acked: true, limit: 20000, ..Default::default() })?;
+            let matched: Vec<query::Enriched> = all.iter().map(query::enrich).filter(|e| query.matches(e)).collect();
+            use std::collections::HashMap;
+            let (mut f_rule, mut f_host, mut f_src, mut f_mitre, mut f_class): (HashMap<String, (String, String, u32)>, HashMap<String, (String, String, u32)>, HashMap<String, (String, String, u32)>, HashMap<String, (String, String, u32)>, HashMap<String, (String, String, u32)>) = Default::default();
+            let bucket: u64 = match secs { 0..=3600 => 60, 3601..=86400 => 3600, 86401..=604800 => 6 * 3600, 604801..=2592000 => 86400, _ => 3 * 86400 };
+            let hist_since = since / bucket * bucket;
+            let nb = ((now_secs() - hist_since) / bucket + 1) as usize;
+            let mut hist = vec![[0u32; 4]; nb];
+            for e in &matched {
+                if let Some(r) = e.rule {
+                    f_rule.entry(r.kind.into()).or_insert((format!("{} {}", r.id, r.name), format!("rule:{}", r.id), 0)).2 += 1;
+                    if !r.technique.is_empty() {
+                        f_mitre.entry(r.technique.into()).or_insert((format!("{} {}", r.technique, r.technique_name), format!("mitre:{}", r.technique), 0)).2 += 1;
+                    }
+                }
+                f_host.entry(e.a.host.clone()).or_insert((e.a.host.clone(), format!("host:{}", quote_if_needed(&e.a.host)), 0)).2 += 1;
+                if !e.a.source.is_empty() {
+                    f_src.entry(e.a.source.clone()).or_insert((e.a.source.clone(), format!("src:{}", e.a.source), 0)).2 += 1;
+                }
+                let cls = rules::level_class(e.level);
+                let qv = match cls { "low" => "level<=6", "medium" => "level>=7 level<=9", "high" => "level>=10 level<=11", _ => "level>=12" };
+                f_class.entry(cls.into()).or_insert((cls.to_string(), qv.to_string(), 0)).2 += 1;
+                let idx = ((e.a.ts.max(hist_since) - hist_since) / bucket) as usize;
+                if let Some(slot) = hist.get_mut(idx) {
+                    slot[match cls { "low" => 0, "medium" => 1, "high" => 2, _ => 3 }] += 1;
+                }
+            }
+            json_resp(s, 200, json!({
+                "total": matched.len(), "shown": matched.len().min(500), "range_seconds": secs, "truncated": all.len() >= 20000, "warnings": warnings,
+                "rows": matched.iter().take(500).map(event_json).collect::<Vec<_>>(),
+                "facets": {"rule": facet(f_rule, 8), "host": facet(f_host, 8), "source": facet(f_src, 8), "mitre": facet(f_mitre, 8), "level": facet(f_class, 4)},
+                "histogram": {"since": hist_since, "bucket": bucket, "t": (0..nb as u64).map(|i| hist_since + i * bucket).collect::<Vec<_>>(),
+                              "low": hist.iter().map(|x| x[0]).collect::<Vec<_>>(), "medium": hist.iter().map(|x| x[1]).collect::<Vec<_>>(),
+                              "high": hist.iter().map(|x| x[2]).collect::<Vec<_>>(), "critical": hist.iter().map(|x| x[3]).collect::<Vec<_>>()},
+                "fields": query::FIELDS,
+            }));
+        }
+        ("GET", "/api/rules") => {
+            let secs = range_secs(req.query.get("range"), 7 * 86400);
+            let all = db::alerts_filtered(c, &db::AlertFilter { since: now_secs().saturating_sub(secs), include_acked: true, limit: 20000, ..Default::default() })?;
+            let mut stat: std::collections::HashMap<&str, (u32, u64, std::collections::HashSet<&str>)> = std::collections::HashMap::new();
+            for a in all.iter().filter(|a| !a.muted) {
+                let e = stat.entry(a.kind.as_str()).or_default();
+                e.0 += 1;
+                e.1 = e.1.max(a.ts);
+                e.2.insert(a.host.as_str());
+            }
+            let fw_name = |k: &str| -> String { rules::FRAMEWORKS.iter().find(|f| f.0 == k).map_or(k, |f| f.1).to_string() };
+            json_resp(s, 200, json!({"range_seconds": secs, "rules": rules::RULES.iter().map(|r| {
+                let st = stat.get(r.kind);
+                json!({"id": r.id, "kind": r.kind, "name": r.name, "desc": r.desc, "level": r.level, "groups": r.groups,
+                       "tactic": if r.tactic.is_empty() { Value::Null } else { json!({"id": r.tactic, "name": rules::tactic_name(r.tactic)}) },
+                       "technique": if r.technique.is_empty() { Value::Null } else { json!({"id": r.technique, "name": r.technique_name, "url": technique_url(r.technique)}) },
+                       "compliance": r.compliance.iter().map(|(fw, id)| json!({"framework": fw_name(fw), "id": id})).collect::<Vec<_>>(),
+                       "count": st.map_or(0, |x| x.0), "last": st.map_or(0, |x| x.1), "hosts": st.map_or(0, |x| x.2.len())})
+            }).collect::<Vec<_>>()}));
+        }
+        ("GET", "/api/insights/mitre") => {
+            let secs = range_secs(req.query.get("range"), 7 * 86400);
+            let all = db::alerts_filtered(c, &db::AlertFilter { since: now_secs().saturating_sub(secs), include_acked: true, limit: 20000, ..Default::default() })?;
+            let tactics: Vec<Value> = rules::TACTICS.iter().map(|(tid, tname)| {
+                let mut techs: Vec<Value> = Vec::new();
+                let mut seen: Vec<&str> = Vec::new();
+                for r in rules::RULES.iter().filter(|r| r.tactic == *tid) {
+                    if seen.contains(&r.technique) { continue; }
+                    seen.push(r.technique);
+                    let rs: Vec<&rules::Rule> = rules::RULES.iter().filter(|x| x.technique == r.technique).collect();
+                    let hits: Vec<&db::AlertRow> = all.iter().filter(|a| !a.muted && rs.iter().any(|x| x.kind == a.kind)).collect();
+                    let hosts: std::collections::HashSet<&str> = hits.iter().map(|a| a.host.as_str()).collect();
+                    techs.push(json!({"id": r.technique, "name": r.technique_name, "url": technique_url(r.technique), "rules": rs.iter().map(|x| x.id).collect::<Vec<_>>(),
+                                      "count": hits.len(), "hosts": hosts.len(), "last": hits.iter().map(|a| a.ts).max().unwrap_or(0), "high": hits.iter().filter(|a| a.severity == "HIGH").count()}));
+                }
+                json!({"id": tid, "name": tname, "covered": !techs.is_empty(), "techniques": techs})
+            }).collect();
+            json_resp(s, 200, json!({"range_seconds": secs, "tactics": tactics,
+                "note": "netwatch observes the network layer. Tactics such as Execution or Privilege Escalation happen on the host and need a host-based agent (for example Wazuh or auditd)."}));
+        }
+        ("GET", "/api/insights/incidents") => {
+            let secs = range_secs(req.query.get("range"), 7 * 86400);
+            let all = db::alerts_filtered(c, &db::AlertFilter { since: now_secs().saturating_sub(secs), include_acked: true, limit: 20000, ..Default::default() })?;
+            let inc = correlate::correlate(&all);
+            let list: Vec<Value> = inc.iter().map(|i| json!({
+                "id": i.id, "kind": i.kind, "title": i.title, "level": i.level, "class": rules::level_class(i.level), "open": i.open, "first": i.first, "last": i.last,
+                "source": i.source, "hosts": i.hosts, "notes": i.notes, "alert_count": i.alerts.len(),
+                "stages": i.stages.iter().map(|st| json!({"id": st.tactic_id, "tactic": st.tactic, "techniques": st.techniques, "count": st.count})).collect::<Vec<_>>(),
+                "alerts": i.alerts.iter().take(80).map(|&ix| event_json(&query::enrich(&all[ix]))).collect::<Vec<_>>(),
+            })).collect();
+            json_resp(s, 200, json!({"incidents": list, "open": inc.iter().filter(|i| i.open).count(), "range_seconds": secs}));
+        }
+        ("GET", "/api/insights/risk") => {
+            let now = now_secs();
+            let hosts = db::hosts(c)?;
+            let recent = db::alerts_filtered(c, &db::AlertFilter { since: now.saturating_sub(86400), include_acked: false, limit: 20000, ..Default::default() })?;
+            let risky = correlate::risky_by_host(&db::all_listeners(c)?);
+            let mut out: Vec<Value> = hosts.iter().map(|h| {
+                let input = correlate::RiskInput {
+                    status: h.status.clone(), is_root: h.is_root, cert_days: (h.cert_expires as i64 - now as i64).div_euclid(86400),
+                    risky_exposed: risky.get(&h.id).copied().unwrap_or(0),
+                    alerts: recent.iter().filter(|a| a.host == h.name && !a.muted).map(|a| (query::enrich(a).level, now.saturating_sub(a.ts))).collect(),
+                };
+                let (score, factors) = correlate::host_risk(&input);
+                json!({"id": h.id, "name": h.name, "score": score, "rating": correlate::rating(score), "status": h.status,
+                       "factors": factors.iter().map(|(l, p)| json!({"label": l, "points": p})).collect::<Vec<_>>()})
+            }).collect();
+            out.sort_by(|a, b| b["score"].as_u64().cmp(&a["score"].as_u64()));
+            let avg = if out.is_empty() { 0 } else { out.iter().filter_map(|x| x["score"].as_u64()).sum::<u64>() / out.len() as u64 };
+            json_resp(s, 200, json!({"hosts": out, "fleet_score": avg}));
+        }
+        ("GET", "/api/insights/compliance") => {
+            if rank < role_rank("admin") {
+                return Ok(forbidden(s));
+            }
+            let secs = range_secs(req.query.get("range"), 30 * 86400);
+            let all = db::alerts_filtered(c, &db::AlertFilter { since: now_secs().saturating_sub(secs), include_acked: true, limit: 20000, ..Default::default() })?;
+            let mut counts: std::collections::HashMap<(&str, &str), (u32, std::collections::BTreeSet<u32>)> = std::collections::HashMap::new();
+            for a in all.iter().filter(|a| !a.muted) {
+                if let Some(r) = rules::by_kind(&a.kind) {
+                    for (fw, id) in r.compliance {
+                        let e = counts.entry((fw, id)).or_default();
+                        e.0 += 1;
+                        e.1.insert(r.id);
+                    }
+                }
+            }
+            let users = db::users(c)?;
+            let admins: Vec<&db::User> = users.iter().filter(|u| u.role == "admin" && !u.disabled).collect();
+            let with2fa = admins.iter().filter(|u| u.totp_secret.is_some()).count();
+            let audit_n = db::audit_rows(c, 1)?.len();
+            let verify = db::audit_verify(c);
+            let hosts = db::hosts(c)?;
+            let down = hosts.iter().filter(|h| h.status == "down").count();
+            let webhook = db::get_setting(c, "webhook_url")?.map_or(false, |u| !u.is_empty());
+            let tls = HSTS.load(Ordering::Relaxed);
+            // (status, detail, [(framework, requirement)])
+            let controls: Vec<(&str, String, Vec<(&str, &str)>)> = vec![
+                (if audit_n > 0 { "pass" } else { "warn" }, "Every login, acknowledgement, assignment, mute, export and account change is recorded with actor, time and source address".into(), vec![("pci_dss", "10.2.1"), ("nist_800_53", "AU-2"), ("hipaa", "164.312.b"), ("cis", "8.2")]),
+                (if verify.is_ok() { "pass" } else { "fail" }, match &verify { Ok(n) => format!("Hash-chained audit log verified: {n} entries, no gaps or edits"), Err(e) => format!("Audit log failed verification: {e}") }, vec![("pci_dss", "10.3.4"), ("nist_800_53", "AU-9")]),
+                ("fail", "Alerts and audit entries are kept for 90 days (metrics 7 days). PCI DSS asks for 12 months: archive the audit log and alerts (CSV/JSON export, webhook to a SIEM) to meet it".into(), vec![("pci_dss", "10.5.1")]),
+                (if !admins.is_empty() && with2fa == admins.len() { "pass" } else if with2fa > 0 { "warn" } else { "fail" }, format!("{with2fa} of {} administrator account(s) use two-factor login", admins.len()), vec![("pci_dss", "8.4.2"), ("nist_800_53", "IA-2"), ("soc2", "CC6.1")]),
+                ("pass", "Agent-to-server traffic always uses mutual TLS (TLS 1.2+) with a private CA and pinned enrollment".into(), vec![("pci_dss", "4.2.1"), ("nist_800_53", "SC-8"), ("hipaa", "164.312.e.1")]),
+                (if tls { "pass" } else { "warn" }, if tls { "Dashboard is served over HTTPS".into() } else { "Dashboard is served over plain HTTP: use --tls or a TLS proxy outside a loopback/SSH-tunnel setup".into() }, vec![("pci_dss", "4.2.1"), ("hipaa", "164.312.e.1")]),
+                (if webhook { "pass" } else { "warn" }, if webhook { "Alerts are forwarded to an external channel".into() } else { "No webhook configured: alerts are only visible in this dashboard".into() }, vec![("cis", "13.1"), ("soc2", "CC7.2"), ("nist_800_53", "SI-4")]),
+                (if down == 0 { "pass" } else { "fail" }, if down == 0 { format!("All {} agent(s) are reporting", hosts.len()) } else { format!("{down} agent(s) are not reporting") }, vec![("pci_dss", "10.7.1")]),
+            ];
+            let frameworks: Vec<Value> = rules::FRAMEWORKS.iter().map(|(fk, fname)| {
+                let reqs: Vec<Value> = rules::REQUIREMENTS.iter().filter(|r| r.0 == *fk).map(|(_, id, title)| {
+                    let (n, rids) = counts.get(&(*fk, *id)).cloned().unwrap_or_default();
+                    let ctl: Vec<Value> = controls.iter().filter(|c| c.2.iter().any(|(f, i)| f == fk && i == id)).map(|c| json!({"status": c.0, "detail": c.1})).collect();
+                    json!({"id": id, "title": title, "alerts": n, "rules": rids, "controls": ctl})
+                }).collect();
+                json!({"key": fk, "name": fname, "requirements": reqs})
+            }).collect();
+            json_resp(s, 200, json!({"range_seconds": secs, "frameworks": frameworks,
+                "disclaimer": "Reference mapping only. netwatch provides network-layer detection and audit evidence; it does not make a system compliant. Confirm the mapping with your auditor."}));
         }
         ("GET", "/api/search") => {
             let q = req.query.get("q").map(|v| v.trim().to_string()).unwrap_or_default();
