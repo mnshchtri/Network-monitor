@@ -42,6 +42,8 @@ netwatch server - central collector
                           (INFO|MEDIUM|HIGH, default MEDIUM), webhook_format (auto|slack|discord|generic)
     netwatch server user add|list|passwd|role|disable|enable|totp|totp-off|delete ...
                           Manage dashboard accounts and roles (see 'netwatch server user')
+    netwatch server ack --source IP --kind K --contains TEXT --from/--to ... [--yes]
+                          Acknowledge many alerts at once; previews unless --yes (see 'server ack --help')
     netwatch server audit [--limit N] [--json] [--verify]
                           Show the audit log, or verify its integrity chain
     netwatch server metrics-token [--dir D] [--disable]
@@ -79,6 +81,7 @@ pub fn cmd(args: &[String]) {
         Some("metrics-token") => metrics_token(rest),
         Some("user") => super::users::user_cmd(rest),
         Some("audit") => super::users::audit_cmd(rest),
+        Some("ack") => super::users::ack_cmd(rest),
         _ => print!("{HELP}"),
     }
 }

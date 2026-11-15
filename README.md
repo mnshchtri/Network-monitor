@@ -240,6 +240,14 @@ sudo netwatch server audit --verify          # recompute the integrity chain
 
 Each entry includes the hash of the one before it, so editing an entry or deleting one from the middle is detected (by `--verify` and by a red banner in the dashboard). **Limit:** someone with write access to the database can rewrite the whole chain consistently, or truncate the end. To catch that, periodically record the `Head hash` that `--verify` prints somewhere the server cannot write to. Exports (CSV/JSON) neutralise spreadsheet formula injection.
 
+Bulk-acknowledge noise from the server's command line (audited, previews unless `--yes`; there is deliberately no "acknowledge everything"):
+
+```sh
+sudo netwatch server ack --source 203.0.113.7 --kind PORT_SCAN              # preview
+sudo netwatch server ack --kind NEW_LISTENER --contains "opened by python3" --yes
+sudo netwatch server ack --kind LISTEN_OVERFLOW --from "2026-11-14 17:05" --to "2026-11-14 18:14" --yes   # times are UTC
+```
+
 Server administration:
 
 ```sh
