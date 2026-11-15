@@ -85,6 +85,9 @@ CREATE INDEX IF NOT EXISTS comments_alert ON alert_comments(alert_id);
 CREATE TABLE IF NOT EXISTS mutes(
   id INTEGER PRIMARY KEY AUTOINCREMENT, host_id TEXT, kind TEXT, until INTEGER NOT NULL, reason TEXT NOT NULL,
   created_by TEXT NOT NULL, created INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS host_addrs(
+  host_id TEXT NOT NULL, ip TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, PRIMARY KEY(host_id, ip));
+CREATE INDEX IF NOT EXISTS host_addrs_ip ON host_addrs(ip);
 CREATE TABLE IF NOT EXISTS users(
   id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL COLLATE NOCASE, pw_hash TEXT NOT NULL,
   role TEXT NOT NULL, disabled INTEGER NOT NULL DEFAULT 0, must_change INTEGER NOT NULL DEFAULT 0,
@@ -220,6 +223,25 @@ pub fn ingest(c: &mut Connection, host: &str, addr: &str, r: &Report) -> Res<(us
         changes += 1;
     }
     tx.execute("UPDATE hosts SET baselined = 1 WHERE id = ?1", [host])?;
+
+    // Remember which addresses belong to this host (from its sockets' local ends), including past
+    // ones: DHCP changes addresses, and "whose IP is this?" must still be answerable for old alerts.
+    let mut own: HashSet<String> = HashSet::new();
+    for cn in r.conns.iter().take(MAX_CONNS) {
+        if let Some((ip, _)) = cn.local.rsplit_once(':') {
+            own.insert(ip.trim_matches(|c| c == '[' || c == ']').to_string());
+        }
+    }
+    for l in r.listeners.iter().take(MAX_LISTENERS) {
+        own.insert(l.addr.clone());
+    }
+    for ip in own.iter().filter(|ip| ip.parse::<std::net::IpAddr>().map_or(false, |a| !a.is_loopback() && !a.is_unspecified())).take(64) {
+        tx.execute(
+            "INSERT INTO host_addrs(host_id, ip, first_seen, last_seen) VALUES(?1,?2,?3,?3)
+             ON CONFLICT(host_id, ip) DO UPDATE SET last_seen = ?3",
+            params![host, ip, now],
+        )?;
+    }
 
     tx.execute("DELETE FROM conns WHERE host_id = ?1", [host])?;
     for cn in r.conns.iter().take(MAX_CONNS) {
@@ -977,4 +999,71 @@ pub fn table_counts(c: &Connection) -> Res<Vec<(&'static str, i64)>> {
         out.push((t, c.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))?));
     }
     Ok(out)
+}
+
+
+// ---------- address ownership ----------
+
+pub struct Owner {
+    pub host: String,
+    pub first_seen: u64,
+    pub last_seen: u64,
+}
+
+/// ip -> the monitored host that had this address (most recent holder wins).
+pub fn address_owners(c: &Connection) -> Res<std::collections::HashMap<String, Owner>> {
+    let mut st = c.prepare(
+        "SELECT a.ip, COALESCE(h.name, a.host_id), a.first_seen, a.last_seen FROM host_addrs a
+         LEFT JOIN hosts h ON h.id = a.host_id ORDER BY a.last_seen",
+    )?;
+    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, Owner { host: r.get(1)?, first_seen: r.get::<_, i64>(2)? as u64, last_seen: r.get::<_, i64>(3)? as u64 })))?;
+    let mut m = std::collections::HashMap::new();
+    for row in rows {
+        let (ip, o) = row?;
+        m.insert(ip, o); // ordered by last_seen ascending: later rows overwrite earlier holders
+    }
+    Ok(m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fleet::proto::{Conn, Listener, Report};
+
+    fn tmp_db(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("nw-test-{tag}-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn host_addresses_are_remembered_and_resolved() {
+        let path = tmp_db("owners");
+        let mut c = open(&path).unwrap();
+        add_host(&c, "h1", "web-1", "fp1", "10.0.0.5").unwrap();
+        add_host(&c, "h2", "db-1", "fp2", "10.0.0.6").unwrap();
+        let conn = |local: &str| Conn { proto: "tcp".into(), state: "ESTABLISHED".into(), local: local.into(), remote: "8.8.8.8:443".into(), pid: None, process: None };
+        let lst = |addr: &str| Listener { proto: "tcp".into(), addr: addr.into(), port: 22, pid: None, process: None, user: "root".into() };
+        let r1 = Report { hostname: "web-1".into(), conns: vec![conn("192.168.1.102:50000"), conn("127.0.0.1:1"), conn("[2001:db8::5]:443")], listeners: vec![lst("0.0.0.0"), lst("::"), lst("10.0.0.5")], ..Default::default() };
+        ingest(&mut c, "h1", "10.0.0.5", &r1).unwrap();
+        let o = address_owners(&c).unwrap();
+        assert_eq!(o.get("192.168.1.102").map(|x| x.host.as_str()), Some("web-1"), "local end of a connection is the host's own address");
+        assert_eq!(o.get("10.0.0.5").map(|x| x.host.as_str()), Some("web-1"));
+        assert_eq!(o.get("2001:db8::5").map(|x| x.host.as_str()), Some("web-1"), "bracketed IPv6 is parsed");
+        assert!(!o.contains_key("127.0.0.1") && !o.contains_key("0.0.0.0") && !o.contains_key("::"), "loopback and wildcard are not addresses of the host");
+        assert!(!o.contains_key("8.8.8.8"), "remote ends are not the host's addresses");
+
+        // DHCP: the host moves to a new address; the old one stays attributable.
+        let r2 = Report { hostname: "web-1".into(), conns: vec![conn("192.168.1.120:50001")], ..Default::default() };
+        ingest(&mut c, "h1", "10.0.0.5", &r2).unwrap();
+        let o = address_owners(&c).unwrap();
+        assert_eq!(o.get("192.168.1.120").map(|x| x.host.as_str()), Some("web-1"));
+        assert_eq!(o.get("192.168.1.102").map(|x| x.host.as_str()), Some("web-1"), "previous address is still resolved");
+        // The address is later re-leased to another host: the most recent holder wins.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let r3 = Report { hostname: "db-1".into(), conns: vec![conn("192.168.1.102:5432")], ..Default::default() };
+        ingest(&mut c, "h2", "10.0.0.6", &r3).unwrap();
+        assert_eq!(address_owners(&c).unwrap().get("192.168.1.102").map(|x| x.host.as_str()), Some("db-1"));
+        let _ = std::fs::remove_file(&path);
+    }
 }

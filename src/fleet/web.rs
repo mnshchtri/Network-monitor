@@ -375,6 +375,10 @@ fn range_secs(v: Option<&String>, default: u64) -> u64 {
     }
 }
 
+fn owner_json(o: Option<&db::Owner>) -> Value {
+    o.map_or(Value::Null, |o| json!({"host": o.host, "first_seen": o.first_seen, "last_seen": o.last_seen}))
+}
+
 fn technique_url(id: &str) -> String {
     format!("https://attack.mitre.org/techniques/{}/", id.replace('.', "/"))
 }
@@ -773,9 +777,10 @@ fn route(st: &State, c: &rusqlite::Connection, req: &Req, s: &mut impl Write, a:
                 }
                 m
             };
+            let owners = db::address_owners(c)?;
             json_resp(s, 200, json!({"sources": rows.iter().map(|r| json!({
                 "ip": r.ip, "count": r.count, "high": r.high, "kinds": r.kinds, "hosts": r.hosts, "first": r.first, "last": r.last,
-                "internal": insights::is_internal(&r.ip), "connections_now": live.get(&r.ip).copied().unwrap_or(0)})).collect::<Vec<_>>()}));
+                "internal": insights::is_internal(&r.ip), "connections_now": live.get(&r.ip).copied().unwrap_or(0), "owner": owner_json(owners.get(&r.ip))})).collect::<Vec<_>>()}));
         }
         ("GET", "/api/insights/source") => {
             let Some(ip) = req.query.get("ip").map(String::as_str).filter(|v| insights::valid_ip(v)) else {
@@ -790,7 +795,7 @@ fn route(st: &State, c: &rusqlite::Connection, req: &Req, s: &mut impl Write, a:
                 *hosts.entry(a.host.as_str()).or_default() += 1;
             }
             json_resp(s, 200, json!({
-                "ip": ip, "internal": insights::is_internal(ip), "conns_total": db::count_conns_from_ip(c, ip)?,
+                "ip": ip, "internal": insights::is_internal(ip), "conns_total": db::count_conns_from_ip(c, ip)?, "owner": owner_json(db::address_owners(c)?.get(ip)),
                 "alerts": alerts.iter().map(alert_json_full).collect::<Vec<_>>(),
                 "kinds": kinds, "hosts": hosts,
                 "conns": conns.iter().map(|x| json!({"host_id": x.host_id, "host": x.host, "proto": x.proto, "state": x.state, "local": x.local, "remote": x.remote, "process": x.process})).collect::<Vec<_>>(),

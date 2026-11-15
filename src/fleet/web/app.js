@@ -524,22 +524,24 @@ function threatsView() {
   if (!rows.length) return [...head, h("div", { class: "empty" }, "No attributed attacker activity in this period ✔")];
   return [...head, tbl(h("thead", {}, h("tr", {}, ["Source", "Scope", "High", "Alerts", "Types", "Hosts hit", "Live conns", "First seen", "Last seen"].map(t => h("th", {}, t)))),
     h("tbody", {}, rows.map(x => h("tr", { class: "click", tabindex: "0", onclick: () => goSource(x.ip), onkeydown: e => { if (e.key === "Enter") goSource(x.ip); } },
-      h("td", { class: "mono" }, x.ip), h("td", {}, intTag(x.internal)), h("td", {}, x.high ? h("span", { class: "sev HIGH" }, x.high) : 0), h("td", {}, x.count), h("td", {}, kindTags(x.kinds)), h("td", {}, x.hosts),
+      h("td", { class: "mono" }, x.ip), h("td", {}, x.owner ? pill("this host: " + x.owner.host, "warnpill") : intTag(x.internal)), h("td", {}, x.high ? h("span", { class: "sev HIGH" }, x.high) : 0), h("td", {}, x.count), h("td", {}, kindTags(x.kinds)), h("td", {}, x.hosts),
       h("td", {}, x.connections_now || 0), h("td", { title: when(x.first) }, ago(x.first)), h("td", { title: when(x.last) }, ago(x.last))))))];
 }
 function sourceDetail() {
   const d = S.srcData, back = h("button", { onclick: () => { S.source = null; S.srcData = null; refresh(); } }, "← All sources");
   if (!d || d.ip !== S.source) return [h("div", { class: "title" }, back, h("h2", { class: "mono" }, S.source)), skeleton()];
   const hostsHit = Object.entries(d.hosts), high = d.alerts.filter(a => a.severity === "HIGH").length, first = d.alerts.length ? Math.min(...d.alerts.map(a => a.ts)) : 0, v6 = d.ip.includes(":");
-  const cmds = d.internal ? null : [["ufw", `sudo ufw deny from ${d.ip}`], ["iptables", `sudo ${v6 ? "ip6tables" : "iptables"} -I INPUT -s ${d.ip} -j DROP`], ["nftables", `sudo nft add rule inet filter input ${v6 ? "ip6" : "ip"} saddr ${d.ip} drop`]];
-  return [h("div", { class: "title" }, back, h("h2", { class: "mono" }, d.ip), intTag(d.internal)),
+  const cmds = d.internal || d.owner ? null : [["ufw", `sudo ufw deny from ${d.ip}`], ["iptables", `sudo ${v6 ? "ip6tables" : "iptables"} -I INPUT -s ${d.ip} -j DROP`], ["nftables", `sudo nft add rule inet filter input ${v6 ? "ip6" : "ip"} saddr ${d.ip} drop`]];
+  return [h("div", { class: "title" }, back, h("h2", { class: "mono" }, d.ip), d.owner ? pill("belongs to " + d.owner.host, "warnpill") : intTag(d.internal)),
     h("div", { class: "cards" }, card("Alerts", d.alerts.length), card("High severity", high, high > 0), card("Hosts targeted", hostsHit.length), card("Connections now", d.conns_total, d.conns_total > 0), card("First seen", first ? ago(first) : "–")),
     h("div", { class: "riskgrid" },
       h("div", { class: "rpanel" }, h("h4", {}, "What it did"), Object.entries(d.kinds).sort((a, b) => b[1] - a[1]).map(([k, n]) => h("div", { class: "barrow" }, h("span", { class: "mono" }, k), h("div", { class: "bartrack" }, (() => { const f = h("div", { class: "barfill" }); f.style.width = Math.max(4, n / Math.max(...Object.values(d.kinds)) * 100) + "%"; return f; })()), h("span", {}, n)))),
       h("div", { class: "rpanel" }, h("h4", {}, "Hosts it touched"), hostsHit.length ? hostsHit.sort((a, b) => b[1] - a[1]).map(([n, c]) => h("div", { class: "ritem" }, h("b", {}, c + "×"), h("div", { class: "grow" }, n))) : h("div", { class: "dim" }, "–")),
       h("div", { class: "rpanel" }, h("h4", {}, "Containment"),
         cmds ? [h("div", { class: "note" }, "Run on the affected host(s) as root. netwatch is read-only and never changes your firewall itself."), ...cmds.map(([n, c]) => h("div", { class: "cmd" }, h("span", { class: "dim" }, n), h("code", {}, c), copyBtn(c)))]
-          : h("div", { class: "dim" }, "This is an internal address (private/loopback/link-local): do not block it blindly. It may be a scanner you own, a misconfigured service, or a compromised machine on your network. Check your asset inventory first."))),
+          : d.owner ? [h("div", {}, h("b", {}, "This is one of your own hosts."), " ", d.ip, " is an address of the monitored host ", h("b", {}, d.owner.host), d.owner.last_seen + 600 < Math.floor(Date.now() / 1000) ? " (it held this address until " + ago(d.owner.last_seen) + "; addresses change with DHCP)." : " (currently its address)."),
+              h("div", { class: "dim" }, "Traffic from a host to itself is usually a local test, a health check, a backup or monitoring job, or a misconfigured service. Blocking it would not stop an attacker. If you did not expect it, look at which process on " + d.owner.host + " is generating it.")]
+          : h("div", { class: "dim" }, "This is an internal address (private/loopback/link-local) that does not belong to any monitored host: do not block it blindly. It may be a scanner you own, a misconfigured service, or a compromised machine on your network. Check your asset inventory first."))),
     h("h4", {}, "Alerts from this source"), alertsTable(true, d.alerts),
     h("h4", {}, "Current connections from this source (" + (d.conns_total > d.conns.length ? "showing " + d.conns.length + " of " + d.conns_total : d.conns_total) + ")"),
     d.conns.length ? tbl(h("thead", {}, h("tr", {}, ["Host", "Proto", "State", "Local", "Remote", "Process"].map(t => h("th", {}, t)))),
