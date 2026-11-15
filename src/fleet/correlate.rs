@@ -93,7 +93,9 @@ fn build(alerts: &[AlertRow], idxs: &[usize], kind: &'static str, key: &str, sou
 ///    campaign (a new service that was immediately accessed from outside is a strong signal).
 ///  * Alerts without a source cluster per host (15 min gap): floods, resets, agent loss, new ports.
 pub fn correlate(alerts: &[AlertRow]) -> Vec<Incident> {
-    let mut order: Vec<usize> = (0..alerts.len()).filter(|&i| !alerts[i].muted && alerts[i].kind != "HOST_UP").collect();
+    // INFO alerts (a dashboard restarting, an unnamed process opening a port) are context, never evidence:
+    // they must not join a cluster or keep an incident "open" once everything that matters is handled.
+    let mut order: Vec<usize> = (0..alerts.len()).filter(|&i| !alerts[i].muted && alerts[i].kind != "HOST_UP" && alerts[i].severity != "INFO").collect();
     order.sort_by_key(|&i| (alerts[i].ts, alerts[i].id));
     let mut by_src: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for &i in &order {
@@ -342,6 +344,23 @@ mod tests {
             a(3, 1020, "h", "CONN_BURST", "INFO", "9.9.9.9", "a"), a(4, 1030, "h", "CONN_BURST", "INFO", "9.9.9.9", "b"),
         ];
         assert!(correlate(&alerts).is_empty(), "INFO-level alerts alone are never an incident");
+    }
+
+    #[test]
+    fn info_alerts_never_join_or_hold_open_an_incident() {
+        // A real attack (all acknowledged) plus INFO noise from the same host in the same minutes.
+        let mut alerts = vec![
+            a(1, 1000, "web", "NEW_LISTENER", "HIGH", "", "new tcp listener on port 3306 opened by python3 (pid 1) (reachable externally)"),
+            a(2, 1005, "web", "NEW_LISTENER", "HIGH", "", "new tcp listener on port 5432 opened by python3 (pid 1) (reachable externally)"),
+            a(3, 1002, "web", "NEW_LISTENER", "INFO", "", "new tcp listener on port 8080 opened by netwatch (pid 2)"),
+            a(4, 1010, "web", "NEW_LISTENER", "INFO", "", "new tcp listener on port 8090 opened by unknown process"),
+        ];
+        alerts[0].acked = true;
+        alerts[1].acked = true;
+        let inc = correlate(&alerts);
+        assert_eq!(inc.len(), 1);
+        assert_eq!(inc[0].alerts, vec![0, 1], "only the HIGH alerts are part of the incident");
+        assert!(!inc[0].open, "unacknowledged INFO noise must not keep it open");
     }
 
     #[test]
