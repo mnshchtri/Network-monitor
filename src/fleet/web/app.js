@@ -4,9 +4,9 @@ const $app = document.getElementById("app");
 const S = { me: null, view: "overview", hosts: [], openAlerts: 0, sel: null, tab: "alerts", tag: null,
   showAcked: false, filter: "", data: null, alerts: [], online: true, timer: null, sessions: [], audit: null,
   risk: null, ov: null, ovRange: "24h", exposure: null, traffic: null, threats: null, tRange: "24h", source: null, srcData: null, health: null, expanded: {}, expOnly: true, expRisky: false, hSort: { k: "status", dir: 1 }, riskyExposed: 0, threatSources: 0, nav: false, aRange: "24h", aSev: "", aMine: false, cRange: "6h", metrics: null, timeline: null, mutes: [], q: "", search: null, drawer: null, editTags: false,
-  ruleMap: null, ruleList: null, evq: "", evRange: "24h", events: null, incidents: null, incRange: "7d", incidentsOv: null, ovEvents: null, riskScores: null, mitre: null, mitreRange: "7d", rules: null, rulesRange: "7d", compliance: null, compRange: "30d", fw: "pci_dss", expandedInc: {}, expandedRule: {}, openIncidents: 0, paused: false, applying: false, settingHash: false };
+  ruleMap: null, ruleList: null, evq: "", evRange: "24h", events: null, incidents: null, incRange: "7d", incidentsOv: null, ovEvents: null, riskScores: null, mitre: null, mitreRange: "7d", rules: null, rulesRange: "7d", compliance: null, compRange: "30d", fw: "pci_dss", expandedInc: {}, expandedRule: {}, openIncidents: 0, refreshSec: 10, lastSec: 10, range: "24h", updatedAt: 0, stale: false, expandedEv: {}, saveOpen: false, applying: false, settingHash: false };
 const canAck = () => S.me && (S.me.role === "operator" || S.me.role === "admin");
-const RANGES = { "1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000, "all": 0 };
+const RANGES = { "1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000, "90d": 7776000, "all": 0 };
 const KINDS = ["NEW_LISTENER", "PORT_SCAN", "BRUTE_FORCE", "CONN_BURST", "CONN_FLOOD", "SYN_FLOOD", "SYN_COOKIES", "LISTEN_OVERFLOW", "RST_STORM", "HOST_DOWN", "HOST_UP"];
 const tbl = (...kids) => h("div", { class: "tablewrap" }, h("table", {}, ...kids));
 const dot = status => h("span", { class: "dot " + status, role: "img", "aria-label": "status: " + status, title: status });
@@ -146,7 +146,9 @@ async function refresh() {
         else if (S.tab === "trends") S.metrics = await api("/api/host/" + S.sel + "/metrics?range=" + S.cRange);
         else if (S.tab === "timeline") S.timeline = (await api("/api/host/" + S.sel + "/timeline")).events;
     }
-  } catch (e) { if (e.message === "login") return; if (S.online) announce("Server unreachable"); S.online = false; }
+    S.updatedAt = Math.floor(Date.now() / 1000);
+  } catch (e) { if (e.message === "login") { S.stale = false; return; } if (S.online) announce("Server unreachable"); S.online = false; }
+  S.stale = false;
   render();
 }
 async function runSearch() {
@@ -170,7 +172,7 @@ const goSource = ip => { S.source = ip; S.srcData = null; go("threats"); };
 /* ---------- rendering ---------- */
 function shell() {
   if (document.getElementById("shell")) return;
-  $app.replaceChildren(h("div", { id: "shell", class: "shell" }, h("header", { id: "hdr" }),
+  $app.replaceChildren(h("div", { id: "shell", class: "shell" }, h("header", { id: "hdr" }), h("div", { id: "ctx" }),
     h("main", {}, h("aside", { id: "side", "aria-label": "Primary" }), h("section", { id: "content", class: "content", tabindex: "-1", "aria-label": "Main content" })),
     h("div", { id: "drawer" }), h("div", { id: "navscrim", onclick: () => setNav(false) }), h("div", { id: "help" }), h("div", { id: "palette" }), h("div", { id: "toasts" }),
     h("div", { id: "live", class: "sr", role: "status", "aria-live": "polite" })));
@@ -195,7 +197,7 @@ function restoreFocus(f) {
 function render() {
   shell();
   const savedFocus = saveFocus();
-  renderHeader(); renderSidebar();
+  renderHeader(); renderSidebar(); renderContext();
   const admin = S.me.role === "admin";
   const c = document.getElementById("content"), keep = c.scrollTop;
   let kids;
@@ -206,6 +208,7 @@ function render() {
   else if (!S.hosts.length && ["overview", "alerts", "hostlist", "incidents"].includes(S.view)) kids = [h("div", { class: "empty" }, h("div", { class: "big" }, "No agents enrolled yet"), "Run ", h("code", {}, "netwatch server token"), " on the server and follow the printed command on a host to monitor.")];
   else kids = (VIEWS[S.view] || overviewView)();
   c.replaceChildren(...kids.filter(k => k != null && k !== false));
+  c.classList.toggle("stale", !!S.stale);
   c.scrollTop = keep;
   restoreFocus(savedFocus);
 }
@@ -214,7 +217,6 @@ function render() {
 function alertsBar() {
   const q = (fmt) => alertQuery("&format=" + fmt + (S.sel ? "&host=" + S.sel : "")).replace("/api/alerts?", "/api/alerts/export?");
   return h("div", { class: "bar" },
-    sel([["1h", "Last hour"], ["24h", "Last 24 hours"], ["7d", "Last 7 days"], ["30d", "Last 30 days"], ["all", "All time"]], S.aRange, v => { S.aRange = v; refresh(); }, "Time range"),
     sel([["", "All severities"], ["HIGH", "High"], ["MEDIUM", "Medium"], ["INFO", "Info"]], S.aSev, v => { S.aSev = v; refresh(); }, "Severity"),
     h("label", {}, h("input", { type: "checkbox", checked: S.aMine, onchange: e => { S.aMine = e.target.checked; refresh(); } }), "assigned to me"),
     h("label", {}, h("input", { type: "checkbox", checked: S.showAcked, onchange: e => { S.showAcked = e.target.checked; refresh(); } }), "show acknowledged"),
@@ -346,11 +348,18 @@ function hostView() {
 }
 
 /* ----- trends: real axes, per-metric scales, hover read-out ----- */
+/* A chart is never the only way to read its numbers: the "Table" toggle swaps the plot for the same data as a table. */
+function chartTable(box, plot, head, rows) {
+  const t = h("div", { class: "tablewrap", hidden: true }, h("table", {}, h("thead", {}, h("tr", {}, head.map(x => h("th", {}, x)))), h("tbody", {}, rows.map(r => h("tr", {}, r.map(c => h("td", {}, c)))))));
+  const b = h("button", { class: "link tv", "aria-pressed": "false", onclick: () => { const on = t.hidden; t.hidden = !on; plot.forEach(p => p.toggleAttribute("hidden", on)); b.textContent = on ? "Chart" : "Table"; b.setAttribute("aria-pressed", String(on)); } }, "Table");
+  box.append(t); return b;
+}
 function niceMax(v) { if (v <= 4) return 4; const p = Math.pow(10, Math.floor(Math.log10(v))); for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p; return 10 * p; }
 function fmtTick(ts, span) { const d = new Date(ts * 1000); return span <= 86400 * 1.5 ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
 function lineChart(title, color, t, vals, since, until, unit) {
   const W = 900, H = 150, L = 46, R = 12, T = 10, B = 24, box = h("div", { class: "chart" }), span = Math.max(until - since, 1);
-  box.append(h("div", { class: "ctitle" }, h("span", {}, title), h("span", { class: "dim" }, vals.length ? `now ${vals[vals.length - 1]} · peak ${Math.max(...vals)}` : "")));
+  const head = h("div", { class: "ctitle" }, h("span", {}, title), h("span", { class: "dim" }, vals.length ? `now ${vals[vals.length - 1]} · peak ${Math.max(...vals)}` : ""));
+  box.append(head);
   if (vals.length < 2) { box.append(h("div", { class: "note" }, "Not enough data in this window yet (reports arrive every few seconds).")); return box; }
   const ymax = niceMax(Math.max(...vals, 1)), X = ts => L + (ts - since) / span * (W - L - R), Y = v => T + (1 - v / ymax) * (H - T - B);
   const svgEl = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": title + " over time", class: color });
@@ -377,7 +386,9 @@ function lineChart(title, color, t, vals, since, until, unit) {
     tip.style.left = Math.min(Math.max(x / W * r.width - 10, 0), r.width - 230) + "px";
   });
   svgEl.addEventListener("mouseleave", () => { tip.hidden = true; guide.setAttribute("visibility", "hidden"); dotEl.setAttribute("visibility", "hidden"); });
-  box.append(svgEl, tip); return box;
+  box.append(svgEl, tip);
+  head.append(chartTable(box, [svgEl, tip], ["Time", unit], t.map((ts, i) => [when(ts), vals[i]]).reverse().slice(0, 300)));
+  return box;
 }
 function trendsView() {
   const m = S.metrics;
@@ -476,7 +487,8 @@ const sortable = (cols, key, onsort) => h("tr", {}, cols.map(([k, label]) => h("
 function stackedBars(title, t, series, since, until, bucket, unit) {
   const W = 900, H = 170, L = 40, R = 10, T = 10, B = 24, box = h("div", { class: "chart" });
   const totals = t.map((_, i) => series.reduce((n, s) => n + s.vals[i], 0)), sum = totals.reduce((a, b) => a + b, 0);
-  box.append(h("div", { class: "ctitle" }, h("span", {}, title), h("span", { class: "legend" }, series.map(s => h("span", {}, h("i", { class: "sw " + s.cls }), s.name)), h("span", { class: "dim" }, sum + " total"))));
+  const head = h("div", { class: "ctitle" }, h("span", {}, title), h("span", { class: "legend" }, series.map(s => h("span", {}, h("i", { class: "sw " + s.cls }), s.name)), h("span", { class: "dim" }, sum + " total")));
+  box.append(head);
   if (!sum) { box.append(h("div", { class: "note" }, "No alerts in this period ✔")); return box; }
   const span = Math.max(until - since, 1), ymax = niceMax(Math.max(...totals)), X = ts => L + (ts - since) / span * (W - L - R), Y = v => T + (1 - v / ymax) * (H - T - B);
   const bw = Math.max(3, bucket / span * (W - L - R) - 3), svgEl = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": title });
@@ -492,12 +504,37 @@ function stackedBars(title, t, series, since, until, bucket, unit) {
     tip.style.left = Math.min(Math.max(X(t[best]) / W * r.width - 10, 0), r.width - 330) + "px";
   });
   svgEl.addEventListener("mouseleave", () => { tip.hidden = true; });
-  box.append(svgEl, tip); return box;
+  box.append(svgEl, tip);
+  head.querySelector(".legend").append(chartTable(box, [svgEl, tip], ["Time", ...series.map(s => s.name)], t.map((ts, i) => [when(ts), ...series.map(s => s.vals[i])]).reverse().slice(0, 300)));
+  return box;
 }
 
 /* ---------- alerts page ---------- */
 function alertsPage() {
   return [h("div", { class: "title" }, h("h2", {}, "Alerts" + (S.tag ? " · hosts tagged " + S.tag : ""))), alertsBar(), alertsTable(true)];
+}
+
+/* One whole split into a few parts: a tall segmented bar with a names-only legend (counts print inside blocks that are wide enough). */
+function segBar(parts) {
+  const total = parts.reduce((n, p) => n + p.value, 0) || 1;
+  const bar = h("div", { class: "segbar", role: "img", "aria-label": parts.map(p => p.label + " " + p.value).join(", ") });
+  parts.filter(p => p.value > 0).forEach(p => {
+    const el = h("div", { class: "part " + p.cls, title: p.label + ": " + p.value }, p.value / total >= 0.12 ? String(p.value) : "");
+    el.style.flex = p.value + " 1 0"; bar.append(el);
+  });
+  return h("div", {}, bar, h("div", { class: "legend names" }, parts.map(p => h("span", {}, h("i", { class: p.cls }), p.label + " " + p.value))));
+}
+const verKey = v => String(v).split(".").map(n => parseInt(n, 10) || 0);
+const verCmp = (x, y) => { const a = verKey(x), b = verKey(y); for (let i = 0; i < Math.max(a.length, b.length); i++) { const d = (a[i] || 0) - (b[i] || 0); if (d) return d; } return 0; };
+function agentSummary() {
+  const hs = S.hosts, count = (f) => { const m = {}; hs.forEach(x => { const k = f(x) || "unknown"; m[k] = (m[k] || 0) + 1; }); return Object.entries(m).sort((p, q) => q[1] - p[1] || p[0].localeCompare(q[0])); };
+  const up = hs.filter(x => x.status === "up").length, down = hs.filter(x => x.status === "down").length, pend = hs.length - up - down;
+  const vers = count(x => x.version), newest = vers.map(v => v[0]).sort(verCmp).pop(), os = count(x => x.os);
+  return h("div", { class: "riskgrid" },
+    h("div", { class: "rpanel" }, h("h4", {}, "Agent status"), segBar([{ label: "Reporting", value: up, cls: "ok" }, { label: "Silent", value: down, cls: "bad" }, { label: "Pending", value: pend, cls: "warn" }])),
+    h("div", { class: "rpanel" }, h("h4", {}, "Agent versions"), h("div", { class: "meterlist" }, barList(vers, r => r[0] + (r[0] === newest ? " (newest)" : ""), r => r[1], r => r[0] === newest ? "" : "warn")),
+      vers.length > 1 ? h("div", { class: "note" }, "Older agents are amber. Upgrade them to match the server.") : null),
+    h("div", { class: "rpanel" }, h("h4", {}, "Operating systems"), h("div", { class: "meterlist" }, barList(os.slice(0, 6), r => r[0], r => r[1]))));
 }
 
 /* ---------- hosts page ---------- */
@@ -507,7 +544,7 @@ function hostsPage() {
   const rows = S.hosts.filter(x => (!S.tag || x.tags.includes(S.tag)) && (!q || [x.name, x.addr, x.os, x.tags.join(" "), x.status].some(v => String(v).toLowerCase().includes(q)))).sort((a, b) => { const A = key(a), B = key(b); return (A < B ? -1 : A > B ? 1 : 0) * dir; });
   const search = h("input", { type: "search", id: "filter", placeholder: "Filter hosts…", value: S.filter, "aria-label": "Filter hosts", oninput: e => { S.filter = e.target.value; const p = e.target.selectionStart; render(); const n = document.getElementById("filter"); n.focus(); n.setSelectionRange(p, p); } });
   const onsort = c => { S.hSort = { k: c, dir: S.hSort.k === c ? -S.hSort.dir : 1 }; render(); };
-  return [h("div", { class: "title" }, h("h2", {}, "Hosts"), h("span", { class: "dim" }, rows.length + " of " + S.hosts.length)), h("div", { class: "bar" }, search),
+  return [h("div", { class: "title" }, h("h2", {}, "Hosts"), h("span", { class: "dim" }, rows.length + " of " + S.hosts.length)), agentSummary(), h("div", { class: "bar" }, search),
     tbl(h("thead", {}, sortable([["status", "Status"], ["name", "Host"], ["addr", "Address"], ["os", "OS"], ["version", "Agent"], ["listeners", "Listening"], ["established", "Established"], ["syn_recv", "SYN_RECV"], ["open_alerts", "Alerts"], ["risk", "Risk"], ["", "Tags"], ["last_seen", "Last seen"]], "hSort", onsort)),
       h("tbody", {}, rows.map(x => h("tr", { class: "click", tabindex: "0", onclick: () => go("hosts", x.id), onkeydown: e => { if (e.key === "Enter") go("hosts", x.id); } },
         h("td", {}, dot(x.status), " ", x.status), h("td", {}, x.name), h("td", { class: "mono" }, x.addr), h("td", {}, x.os), h("td", {}, x.version), h("td", {}, x.listeners), h("td", {}, x.established),
@@ -518,7 +555,7 @@ function hostsPage() {
 function threatsView() {
   if (S.source) return sourceDetail();
   const rows = S.threats;
-  const head = [h("div", { class: "title" }, h("h2", {}, "Threat sources"), h("div", { class: "grow" }), rangeSeg(["1h", "24h", "7d", "30d"], S.tRange, r => { S.tRange = r; S.threats = null; refresh(); })),
+  const head = [h("div", { class: "title" }, h("h2", {}, "Threat sources")),
     h("div", { class: "note" }, "Addresses named in alerts: port scans, brute force, connection floods. Ranked by high-severity alerts. Click one to investigate and get containment commands.")];
   if (!rows) return [...head, skeleton()];
   if (!rows.length) return [...head, h("div", { class: "empty" }, "No attributed attacker activity in this period ✔")];
@@ -627,10 +664,5 @@ async function start() {
   try { S.me = await api("/api/me"); } catch (e) { return; }   // api() shows the login form on 401
   if (S.me.must_change) return showChangePassword();
   if (location.hash.length > 2) applyHash(); else { setHash(); refresh(); }
-  S.timer = setInterval(() => {
-    const id = document.activeElement?.id, tag = document.activeElement?.tagName;
-    // Don't rebuild the page under the user's hands: typing in a query/filter box, choosing from a dropdown, or reading a chart tooltip.
-    if (S.paused || document.hidden || ["filter", "gsearch", "evq", "pin"].includes(id) || tag === "SELECT" || tag === "TEXTAREA" || S.view === "search" || document.querySelector(".chart:hover")) return;
-    refresh();
-  }, 3000);
+  schedule();
 }

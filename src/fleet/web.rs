@@ -729,8 +729,8 @@ fn route(st: &State, c: &rusqlite::Connection, req: &Req, s: &mut impl Write, a:
             }));
         }
         ("GET", "/api/insights/overview") => {
-            let secs: u64 = if req.query.get("range").map(String::as_str) == Some("7d") { 7 * 86400 } else { 86400 };
-            let bucket = if secs > 86400 { 6 * 3600 } else { 3600 };
+            let secs = range_secs(req.query.get("range"), 86400);
+            let bucket: u64 = match secs { 0..=3600 => 300, 3601..=86400 => 3600, 86401..=604800 => 6 * 3600, 604801..=2592000 => 86400, _ => 3 * 86400 };
             let since = now_secs().saturating_sub(secs) / bucket * bucket;
             let tr = db::alert_trend(c, since, bucket)?;
             // Fleet trend buckets adapt to how much history exists, so a young install still gets a curve.
@@ -761,12 +761,7 @@ fn route(st: &State, c: &rusqlite::Connection, req: &Req, s: &mut impl Write, a:
             json_resp(s, 200, insights::traffic(&db::all_conns(c)?, &lp));
         }
         ("GET", "/api/insights/threats") => {
-            let secs: u64 = match req.query.get("range").map(String::as_str) {
-                Some("1h") => 3600,
-                Some("7d") => 7 * 86400,
-                Some("30d") => 30 * 86400,
-                _ => 86400,
-            };
+            let secs = range_secs(req.query.get("range"), 86400);
             let rows = db::threats(c, now_secs().saturating_sub(secs))?;
             let live: std::collections::HashMap<String, u32> = {
                 let mut m = std::collections::HashMap::new();

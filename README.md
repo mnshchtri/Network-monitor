@@ -190,7 +190,15 @@ Or push alerts to any HTTP collector with the `generic` webhook (`netwatch serve
 
 #### Interface
 
-Enterprise-style navigation grouped as Monitor / Detect / Assess / Manage / Account, with live badges. **Ctrl/Cmd+K** opens a command palette (jump to any page or host, "hunt events for…", toggle theme or density). Every view is a **shareable URL** (`#/events?q=level%3E%3D10`, `#/host/<id>/ports`, `#/threats/<ip>`) and Back/Forward work. Also: toasts for every action, skeleton loaders, a collapsible sidebar, comfortable/compact density, a live/paused refresh toggle, light and dark themes, and keyboard chords (`?` lists them all).
+Built to the conventions of enterprise SOC consoles (Wazuh, Kibana):
+
+- **Context bar.** Breadcrumbs on the left; on the right one **global time range** (1 h to 90 d) that scopes every chart, table and count on the page, plus an auto-refresh interval (off, 5 s to 1 min), a refresh button and "Updated … ago". Your choices are remembered. A refetch keeps the current view and dims it: no skeleton flash, no layout jump.
+- **Navigation.** Sidebar grouped as Monitor / Detect / Assess / Manage / Account with live badges and a collapsible icon rail; **Ctrl/Cmd+K** command palette (pages, hosts, time ranges, "hunt events for…", theme, density); every view is a shareable URL (`#/events?q=level%3E%3D10`, `#/host/<id>/ports`, `#/threats/<ip>`) and Back/Forward work.
+- **Event explorer extras.** Expand any row for the full event document with per-field include (+) and exclude (−), raw JSON, **saved searches** (kept in your browser), and "Copy link" to share an exact search.
+- **Hosts.** Agent status (segmented bar), agent versions (older ones flagged) and operating systems above a sortable table with a risk column.
+- **Charts** follow data-viz rules: part-to-whole as segmented bars or ranked bars (no donuts), one hue for magnitude, severity in three validated classes (routine in two gray steps, red for high and critical), 2 px surface gaps, a legend, hover read-outs, and a **Table** toggle on every chart so no value depends on hover or color.
+- **Look.** Flat panels with hairline borders, sentence-case labels, tabular numbers, a teal accent, light and dark themes. All 88 text and chart color pairs meet WCAG AA, and the severity chart palette was checked for colour-blind separation (worst pair ΔE 9, normal-vision floor 18).
+- Also: toasts for every action, skeleton loaders on first load, comfortable/compact density, keyboard chords (`?` lists them all).
 
 #### Analysis pages
 

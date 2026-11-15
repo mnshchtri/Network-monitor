@@ -34,6 +34,10 @@ const ICONS = {
   user: ["M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2", ["c", 12, 7, 4]],
   pause: [["r", 6, 4, 4, 16, 1], ["r", 14, 4, 4, 16, 1]],
   density: [["l", 3, 6, 21, 6], ["l", 3, 12, 21, 12], ["l", 3, 18, 21, 18]],
+  refresh: ["M23 4v6h-6", "M20.49 15a9 9 0 1 1-2.12-9.36L23 10"],
+  link: ["M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71", "M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"],
+  save: ["M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z", ["p", "17 21 17 13 7 13 7 21"], ["p", "7 3 7 8 15 8"]],
+  table: [["r", 3, 3, 18, 18, 2], ["l", 3, 9, 21, 9], ["l", 3, 15, 21, 15], ["l", 9, 3, 9, 21]],
 };
 function icon(name, cls) {
   const s = svg("svg", { viewBox: "0 0 24 24", class: "icon" + (cls ? " " + cls : ""), "aria-hidden": "true", focusable: "false" });
@@ -102,6 +106,66 @@ const PAGES = [
 const pageById = id => PAGES.find(p => p.id === id);
 const pageTitles = { search: "Search", hosts: "Host" };
 
+/* ---------- global time range, refresh and the context bar ---------- */
+const RANGE_OPTS = ["1h", "24h", "7d", "30d", "90d"];
+const RANGE_NAMES = { "1h": "Last hour", "24h": "Last 24 hours", "7d": "Last 7 days", "30d": "Last 30 days", "90d": "Last 90 days" };
+const TIMED_VIEWS = ["overview", "alerts", "incidents", "events", "threats", "mitre", "rules", "compliance"];
+const isTimed = () => TIMED_VIEWS.includes(S.view) || (S.view === "hosts" && S.sel && S.tab === "alerts");
+function applyRange(r) {
+  if (!RANGE_OPTS.includes(r)) return;
+  S.range = S.ovRange = S.evRange = S.incRange = S.mitreRange = S.rulesRange = S.compRange = S.tRange = S.aRange = r;
+  try { localStorage.setItem("nw_range", r); } catch (e) {}
+}
+function setRange(r) { if (r === S.range) return; applyRange(r); setHash(); reload(); }
+/* Refetching holds the previous render (dimmed) instead of flashing a skeleton or jumping the layout. */
+function reload() { S.stale = true; const c = document.getElementById("content"); if (c) c.classList.add("stale"); refresh(); }
+function setRefresh(sec) {
+  S.refreshSec = sec; if (sec) S.lastSec = sec;
+  try { localStorage.setItem("nw_refresh", String(sec)); } catch (e) {}
+  schedule(); announce(sec ? "Auto refresh every " + sec + " seconds" : "Auto refresh off"); render();
+}
+function schedule() {
+  clearInterval(S.timer);
+  if (!S.refreshSec) return;
+  S.timer = setInterval(() => {
+    const id = document.activeElement?.id, tag = document.activeElement?.tagName;
+    // Don't rebuild the page under the user's hands: typing in a query/filter box, choosing from a dropdown, or reading a chart tooltip.
+    if (document.hidden || ["filter", "gsearch", "evq", "pin", "svname"].includes(id) || tag === "SELECT" || tag === "TEXTAREA" || S.view === "search" || document.querySelector(".chart:hover")) return;
+    refresh();
+  }, S.refreshSec * 1000);
+}
+(function restoreRangePrefs() {
+  try {
+    const r = localStorage.getItem("nw_range"); if (RANGE_OPTS.includes(r)) applyRange(r);
+    const f = localStorage.getItem("nw_refresh"); if (f !== null && ["0", "5", "10", "30", "60"].includes(f)) { S.refreshSec = +f; if (+f) S.lastSec = +f; }
+  } catch (e) {}
+})();
+const updatedText = () => !S.updatedAt ? "" : (() => { const d = Math.max(0, Math.floor(Date.now() / 1000 - S.updatedAt)); return "Updated " + (d < 2 ? "just now" : d < 60 ? d + " s ago" : Math.floor(d / 60) + " min ago"); })();
+setInterval(() => { const e = document.getElementById("updated"); if (e) e.textContent = updatedText(); }, 1000);
+
+function breadcrumbs() {
+  const pg = pageById(S.view), out = [];
+  if (S.view === "hosts") { out.push({ label: "Monitor" }, { label: "Hosts", go: () => go("hostlist") }, { label: S.data && S.data.host ? S.data.host.name : "Host", here: true }); }
+  else if (S.view === "search") out.push({ label: "Search" }, { label: S.q ? "“" + S.q.trim() + "”" : "Results", here: true });
+  else if (pg) {
+    out.push({ label: pg.group });
+    if (S.view === "threats" && S.source) out.push({ label: pg.label, go: () => { S.source = null; S.srcData = null; go("threats"); } }, { label: S.source, here: true });
+    else out.push({ label: pg.label, here: true });
+  }
+  return out;
+}
+function renderContext() {
+  const ctx = document.getElementById("ctx"); if (!ctx) return;
+  const crumbs = breadcrumbs();
+  ctx.replaceChildren(...[
+    h("nav", { class: "crumbs", "aria-label": "Breadcrumb" }, crumbs.map((c, i) => [i ? icon("chevR", "sm") : null, c.go ? h("button", { class: "link", onclick: c.go }, c.label) : h("span", { class: c.here ? "here" : "" }, c.label)])),
+    h("div", { class: "grow" }),
+    isTimed() ? h("div", { class: "seg", role: "group", "aria-label": "Time range for every chart and table on this page" }, RANGE_OPTS.map(r => h("button", { class: S.range === r ? "on" : "", "aria-pressed": String(S.range === r), title: RANGE_NAMES[r], onclick: () => setRange(r) }, r.replace(/^(\d+)([hd])$/, "$1 $2")))) : null,
+    h("label", { class: "refresh" }, "Refresh", sel([["0", "Off"], ["5", "5 s"], ["10", "10 s"], ["30", "30 s"], ["60", "1 min"]], String(S.refreshSec), v => setRefresh(+v), "Auto-refresh interval")),
+    h("button", { class: "icon", title: "Refresh now", "aria-label": "Refresh now", onclick: reload }, icon("refresh")),
+    h("span", { class: "updated", id: "updated", "aria-hidden": "true" }, updatedText())].filter(x => x != null && x !== false));
+}
+
 /* ---------- header ---------- */
 function renderHeader() {
   const hdr = document.getElementById("hdr");
@@ -109,9 +173,10 @@ function renderHeader() {
   const keep = document.activeElement && document.activeElement.id === "gsearch";
   const box = h("input", { type: "search", id: "gsearch", class: "gsearch", placeholder: "Search hosts, ports, IPs, alerts…", value: S.q, "aria-label": "Search",
     oninput: e => { S.q = e.target.value; }, onkeydown: e => { if (e.key === "Enter") runSearch(); } });
-  const live = h("button", { class: "livepill " + (S.paused ? "off" : S.online ? "" : "dead"), title: S.paused ? "Auto-refresh paused: click to resume" : "Auto-refresh every 3 s: click to pause", "aria-pressed": String(S.paused),
-    onclick: () => { S.paused = !S.paused; announce(S.paused ? "Auto refresh paused" : "Auto refresh resumed"); if (!S.paused) refresh(); else render(); } },
-    h("span", { class: "d" }), " ", h("span", { class: "t" }, S.paused ? "Paused" : S.online ? "Live" : "Offline"));
+  const paused = !S.refreshSec;
+  const live = h("button", { class: "livepill " + (paused ? "off" : S.online ? "" : "dead"), title: paused ? "Auto-refresh is off: click to resume" : "Auto-refresh every " + S.refreshSec + " s: click to pause", "aria-pressed": String(paused),
+    onclick: () => setRefresh(paused ? (S.lastSec || 10) : 0) },
+    h("span", { class: "d" }), " ", h("span", { class: "t" }, !S.online ? "Offline" : paused ? "Paused" : "Live"));
   hdr.replaceChildren(
     h("button", { id: "burger", class: "burger icon", "aria-label": "Open menu", "aria-expanded": String(S.nav), "aria-controls": "side", onclick: () => setNav(!S.nav) }, icon("menu")),
     h("div", { class: "brand" }, icon("shield"), h("span", { class: "wm" }, "net", h("span", {}, "watch"))),
@@ -180,9 +245,10 @@ function paletteItems(q) {
   PAGES.filter(p => !p.admin || admin).forEach(p => add("Go to", p.label, p.icon, "", () => { S.source = null; go(p.id); }));
   S.hosts.forEach(x => add("Hosts", x.name, "server", x.addr + " · " + x.status, () => go("hosts", x.id), x.name + " " + x.addr + " " + x.tags.join(" ")));
   add("Actions", "Toggle light / dark theme", curTheme() === "light" ? "moon" : "sun", "t", () => setTheme(curTheme() === "light" ? "dark" : "light"));
+  RANGE_OPTS.forEach(r => add("Time range", RANGE_NAMES[r], "refresh", "", () => setRange(r), "time range " + RANGE_NAMES[r] + " " + r));
   add("Actions", "Toggle compact density", "density", "", toggleDensity);
   add("Actions", "Collapse / expand sidebar", "chevsL", "", toggleNavMini);
-  add("Actions", "Pause / resume live refresh", "pause", "", () => { S.paused = !S.paused; if (!S.paused) refresh(); else render(); });
+  add("Actions", "Pause / resume live refresh", "pause", "", () => setRefresh(S.refreshSec ? 0 : (S.lastSec || 10)));
   add("Actions", "Keyboard shortcuts", "info", "?", toggleHelp);
   const t = q.trim();
   const out = [];
@@ -234,7 +300,7 @@ function hashFromState() {
   if (S.view === "hosts") p = S.sel ? "host/" + S.sel + (S.tab && S.tab !== "alerts" ? "/" + S.tab : "") : "overview";
   else if (S.view === "threats" && S.source) p = "threats/" + encodeURIComponent(S.source);
   else { const pg = pageById(S.view); p = pg ? pg.path : S.view; }
-  if (S.view === "events") { if (S.evq) qs.q = S.evq; if (S.evRange !== "24h") qs.range = S.evRange; }
+  if (S.view === "events") { if (S.evq) qs.q = S.evq; if (S.range !== "24h") qs.range = S.range; }
   if (S.view === "search" && S.q) qs.q = S.q;
   const q = new URLSearchParams(qs).toString();
   return "#/" + p + (q ? "?" + q : "");
@@ -259,7 +325,7 @@ function applyHash() {
       const pg = PAGES.find(p => p.path === first);
       S.view = pg ? pg.id : "overview"; S.sel = null; S.source = null;
       if (pg && pg.admin && S.me.role !== "admin") S.view = "overview";
-      if (S.view === "events") { S.evq = qs.get("q") || ""; S.evRange = qs.get("range") || "24h"; S.events = null; }
+      if (S.view === "events") { S.evq = qs.get("q") || ""; if (qs.get("range")) applyRange(qs.get("range")); S.events = null; }
     }
     S.data = null; S.filter = ""; setNav(false);
     refresh();
